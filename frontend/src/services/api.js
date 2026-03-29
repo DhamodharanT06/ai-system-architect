@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -33,7 +33,8 @@ export const getExamples = async () => {
 };
 
 export const streamBlueprint = (problemStatement, context = null) => {
-  const url = new URL(`${API_BASE_URL}/api/stream-generate`);
+  const baseUrl = API_BASE_URL || window.location.origin;
+  const url = new URL('/api/stream-generate', baseUrl);
   url.searchParams.append('problem_statement', problemStatement);
   if (context) {
     url.searchParams.append('context', context);
