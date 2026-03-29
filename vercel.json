@@ -1,16 +1,15 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "npm run install:frontend",
-  "buildCommand": "npm run build",
-  "outputDirectory": "frontend/dist",
-  "routes": [
+  "version": 2,
+  "builds": [
     {
-      "src": "/api/(.*)",
-      "dest": "/api/index.py"
-    },
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build"
+    }
+  ],
+  "rewrites": [
     {
-      "src": "/(.*)",
-      "dest": "/index.html"
+      "source": "/api/(.*)",
+      "destination": "https://REPLACE_WITH_BACKEND_HOST/api/$1"
     }
   ]
 }

@@ -1,6 +1,8 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Use relative paths in production (Vercel will rewrite `/api` to the backend).
+// When developing locally, set `VITE_API_URL` in `frontend/.env` (e.g. http://localhost:8000).
+const API_BASE_URL = import.meta.env.VITE_API_URL ?? '';
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -33,11 +35,9 @@ export const getExamples = async () => {
 };
 
 export const streamBlueprint = (problemStatement, context = null) => {
-  const url = new URL(`${API_BASE_URL}/api/stream-generate`);
-  url.searchParams.append('problem_statement', problemStatement);
-  if (context) {
-    url.searchParams.append('context', context);
-  }
-  
-  return new EventSource(url.toString());
+  const base = API_BASE_URL || '';
+  const params = new URLSearchParams({ problem_statement: problemStatement });
+  if (context) params.append('context', context);
+  const url = `${base}/api/stream-generate?${params.toString()}`;
+  return new EventSource(url);
 };
