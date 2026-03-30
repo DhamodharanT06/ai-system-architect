@@ -123,7 +123,7 @@ async def generate_project_blueprint(request: UserMessage) -> ChatResponse:
         logger.error(f"Validation error: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error generating blueprint: {str(e)}")
+        logger.exception(f"ERROR generating blueprint (full traceback above): {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error generating blueprint: {str(e)}"

@@ -3,6 +3,7 @@ import logging
 from config import settings
 from models import ProjectBlueprint
 from typing import Optional, List
+from groq import Groq
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +41,12 @@ def get_groq_client():
     return None
 
 # Preferred models are attempted in order when auto-discovering a working model.
+# These are actual Groq-hosted models (free tier available)
 PREFERRED_CHAT_MODELS = [
-  "gpt-neo-2.7b",
-  "gpt-j-6b",
-  "mpt-7b-instruct",
-  "mistral-7b-instruct",
+  "llama-3.3-70b-versatile",
+  "llama-3.1-8b-instant",
+  "mixtral-8x7b-32768",
+  "llama-2-70b-chat",
 ]
 
 _cached_available_models: Optional[List[str]] = None
@@ -138,14 +140,18 @@ def _parse_blueprint_response(response_text: str, problem_statement: str) -> Pro
 def _run_non_stream_completion(user_message: str):
   """Run a non-streaming completion with automatic model fallback."""
   last_error: Optional[Exception] = None
+  
+  model_candidates = _get_model_candidates()
+  logger.info("Model candidates to try: %s", model_candidates)
 
-  for model in _get_model_candidates():
+  for model in model_candidates:
     try:
       logger.info("Trying Groq model: %s", model)
       client = get_groq_client()
       if client is None:
         raise RuntimeError("Groq client not initialized in this environment")
 
+      logger.info("Making API call to Groq with model: %s", model)
       message = client.chat.completions.create(
         model=model,
         max_tokens=4000,
@@ -155,10 +161,11 @@ def _run_non_stream_completion(user_message: str):
           {"role": "user", "content": user_message},
         ],
       )
+      logger.info("API call succeeded with model: %s", model)
       return message
     except Exception as e:
       last_error = e
-      logger.warning("Model %s failed: %s", model, str(e))
+      logger.warning("Model %s failed: %s", model, str(e), exc_info=True)
       if not _is_retryable_model_error(e):
         raise
 
