@@ -26,7 +26,7 @@ app = FastAPI(
 # Configure CORS
 allowed_origins = [
     settings.frontend_url,
-    "https://ai-system-architecture.vercel.app/",
+    "https://ai-system-architecture.vercel.app",
     "http://localhost:3000",
     "http://localhost:5173",
 ]
