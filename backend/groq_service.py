@@ -1,20 +1,43 @@
 import json
 import logging
-from groq import Groq
 from config import settings
 from models import ProjectBlueprint
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
-client = Groq(api_key=settings.groq_api_key)
+# Lazy-initialized Groq client. Some serverless environments (Vercel)
+# may include incompatible vendored dependencies that cause import-time
+# failures (e.g., unexpected 'proxies' kwarg). Initialize on first use
+# and handle failures gracefully so the module import does not crash.
+_client = None
+
+
+def get_groq_client():
+  global _client
+  if _client is not None:
+    return _client
+
+  try:
+    from groq import Groq
+    _client = Groq(api_key=settings.groq_api_key)
+    return _client
+  except TypeError as e:
+    # Known incompatibility: underlying HTTP client signature mismatch.
+    logger.error("Groq client initialization failed (TypeError): %s", str(e))
+    _client = None
+    return None
+  except Exception as e:
+    logger.exception("Unexpected error initializing Groq client: %s", str(e))
+    _client = None
+    return None
 
 # Preferred models are attempted in order when auto-discovering a working model.
 PREFERRED_CHAT_MODELS = [
-  "llama-3.3-70b-versatile",
-  "llama-3.1-8b-instant",
-  "openai/gpt-oss-120b",
-  "openai/gpt-oss-20b",
+  "gpt-neo-2.7b",
+  "gpt-j-6b",
+  "mpt-7b-instruct",
+  "mistral-7b-instruct",
 ]
 
 _cached_available_models: Optional[List[str]] = None
@@ -42,6 +65,12 @@ def _get_available_models() -> List[str]:
     return _cached_available_models
 
   try:
+    client = get_groq_client()
+    if client is None:
+      logger.warning("Groq client unavailable; skipping model discovery")
+      _cached_available_models = []
+      return _cached_available_models
+
     models_response = client.models.list()
     _cached_available_models = [m.id for m in models_response.data if getattr(m, "id", None)]
     logger.info("Detected %s available Groq models", len(_cached_available_models))
@@ -106,6 +135,10 @@ def _run_non_stream_completion(user_message: str):
   for model in _get_model_candidates():
     try:
       logger.info("Trying Groq model: %s", model)
+      client = get_groq_client()
+      if client is None:
+        raise RuntimeError("Groq client not initialized in this environment")
+
       message = client.chat.completions.create(
         model=model,
         max_tokens=4000,
@@ -134,6 +167,10 @@ def _run_stream_completion(user_message: str):
   for model in _get_model_candidates():
     try:
       logger.info("Trying Groq streaming model: %s", model)
+      client = get_groq_client()
+      if client is None:
+        raise RuntimeError("Groq client not initialized in this environment")
+
       return client.chat.completions.create(
         model=model,
         max_tokens=4000,
