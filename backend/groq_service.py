@@ -3,13 +3,11 @@ import logging
 from config import settings
 from models import ProjectBlueprint
 from typing import Optional, List
+from groq import Groq
 
 logger = logging.getLogger(__name__)
 
-# Lazy-initialized Groq client. Some serverless environments (Vercel)
-# may include incompatible vendored dependencies that cause import-time
-# failures (e.g., unexpected 'proxies' kwarg). Initialize on first use
-# and handle failures gracefully so the module import does not crash.
+# Groq client instance
 _client = None
 
 
@@ -19,24 +17,15 @@ def get_groq_client():
     return _client
 
   if not settings.groq_api_key or settings.groq_api_key.strip() == "":
-    logger.error("GROQ_API_KEY environment variable is not set or empty. Please set GROQ_API_KEY in your environment.")
-    _client = None
+    logger.error("GROQ_API_KEY environment variable is not set or empty.")
     return None
 
   try:
-    from groq import Groq
-    logger.info("Initializing Groq client with API key (first 8 chars): %s***", settings.groq_api_key[:8])
     _client = Groq(api_key=settings.groq_api_key)
     logger.info("Groq client initialized successfully")
     return _client
-  except TypeError as e:
-    # Known incompatibility: underlying HTTP client signature mismatch.
-    logger.error("Groq client initialization failed (TypeError): %s", str(e))
-    _client = None
-    return None
   except Exception as e:
-    logger.exception("Unexpected error initializing Groq client: %s", str(e))
-    _client = None
+    logger.exception("Error initializing Groq client: %s", str(e))
     return None
 
 # Preferred models are attempted in order when auto-discovering a working model.
