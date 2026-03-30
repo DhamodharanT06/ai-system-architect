@@ -26,7 +26,7 @@ app = FastAPI(
 # Configure CORS
 allowed_origins = [
     settings.frontend_url,
-    "https://ai-system-architect-ruby.vercel.app",
+    "https://ai-system-architecture.vercel.app/",
     "http://localhost:3000",
     "http://localhost:5173",
 ]
@@ -62,20 +62,6 @@ async def health_check():
     return {
         "status": "healthy",
         "debug": settings.debug
-    }
-
-
-@app.get("/api/debug")
-async def debug_settings():
-    """Debug endpoint - check if environment variables are set correctly"""
-    return {
-        "frontend_url": settings.frontend_url,
-        "backend_port": settings.backend_port,
-        "debug": settings.debug,
-        "groq_api_key_set": bool(settings.groq_api_key and settings.groq_api_key.strip() != ""),
-        "groq_api_key_length": len(settings.groq_api_key) if settings.groq_api_key else 0,
-        "groq_model": settings.groq_model if settings.groq_model else "(not configured)",
-        "cors_allowed_origins": allowed_origins,
     }
 
 

@@ -13,6 +13,8 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+MAX_RESPONSE_TOKENS = 1800
+
 # Groq client instance
 _client = None
 
@@ -56,7 +58,7 @@ def _run_non_stream_completion_http(model: str, user_message: str) -> str:
 
   payload = {
     "model": model,
-    "max_tokens": 4000,
+    "max_tokens": MAX_RESPONSE_TOKENS,
     "temperature": 0.2,
     "messages": [
       {"role": "system", "content": SYSTEM_PROMPT},
@@ -192,7 +194,7 @@ def _run_non_stream_completion(user_message: str):
       logger.info("Making API call to Groq with model: %s", model)
       message = client.chat.completions.create(
         model=model,
-        max_tokens=4000,
+        max_tokens=MAX_RESPONSE_TOKENS,
         temperature=0.2,
         messages=[
           {"role": "system", "content": SYSTEM_PROMPT},
@@ -225,7 +227,7 @@ def _run_stream_completion(user_message: str):
 
       return client.chat.completions.create(
         model=model,
-        max_tokens=4000,
+        max_tokens=MAX_RESPONSE_TOKENS,
         temperature=0.2,
         messages=[
           {"role": "system", "content": SYSTEM_PROMPT},
@@ -243,106 +245,33 @@ def _run_stream_completion(user_message: str):
     f"No working Groq streaming model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
   )
 
-SYSTEM_PROMPT = """You are an expert AI System Architect and technical mentor. Your role is to help developers, startups, and hackathon participants generate comprehensive project blueprints.
-
-When given a problem statement or project idea, you must generate a detailed JSON response that includes:
-
-1. **Project Name**: A catchy, memorable name
-2. **Description**: Clear overview of the project
-3. **System Architecture**: Components (Frontend, Backend, Database, External APIs, Infrastructure)
-4. **Tech Stack**: Technology choices with reasons
-5. **Workflow**: Step-by-step process flows
-6. **Prerequisites**: Knowledge, tools, and infrastructure needed
-7. **Solution Approaches**: Multiple ways to solve the problem (at least 2-3)
-8. **Real-World Examples**: Similar projects or implementations
-9. **Learning References**: Tutorials, docs, courses
-10. **Timeline**: Estimated development phases
-11. **Budget**: Estimated costs (if applicable)
-12. **Next Steps**: Action items to get started
-
-Return ONLY valid JSON in this exact format:
+SYSTEM_PROMPT = """You are an AI system architect. Output ONLY valid JSON (no markdown) matching this schema exactly:
 {
-  "project_name": "string",
-  "description": "string",
-  "problem_statement": "string",
-  "system_architecture": [
-    {
-      "name": "string",
-      "type": "frontend|backend|database|external_api|infrastructure",
-      "description": "string",
-      "responsibilities": ["string"],
-      "technologies": ["string"]
-    }
-  ],
-  "tech_stack": [
-    {
-      "name": "string",
-      "category": "string",
-      "reason": "string",
-      "version": "string or null"
-    }
-  ],
-  "workflow": [
-    {
-      "step_number": 1,
-      "title": "string",
-      "description": "string",
-      "components_involved": ["string"],
-      "key_actions": ["string"]
-    }
-  ],
-  "prerequisites": [
-    {
-      "category": "string",
-      "items": ["string"]
-    }
-  ],
-  "solution_approaches": [
-    {
-      "name": "string",
-      "description": "string",
-      "pros": ["string"],
-      "cons": ["string"],
-      "complexity": "Simple|Medium|Complex",
-      "estimated_time": "string",
-      "best_for": "string"
-    }
-  ],
-  "real_world_examples": [
-    {
-      "title": "string",
-      "description": "string",
-      "company": "string",
-      "link": "string or null",
-      "lessons_learned": ["string"]
-    }
-  ],
-  "learning_references": [
-    {
-      "title": "string",
-      "url": "string",
-      "type": "Tutorial|Documentation|Guide|Course|Blog",
-      "difficulty": "Beginner|Intermediate|Advanced"
-    }
-  ],
-  "timeline": {
-    "phase_name": "duration"
-  },
-  "estimated_budget": "string or null",
-  "next_steps": ["string"]
+  "project_name": string,
+  "description": string,
+  "problem_statement": string,
+  "system_architecture": [{"name": string, "type": "frontend|backend|database|external_api|infrastructure", "description": string, "responsibilities": [string], "technologies": [string]}],
+  "tech_stack": [{"name": string, "category": string, "reason": string, "version": string|null}],
+  "workflow": [{"step_number": number, "title": string, "description": string, "components_involved": [string], "key_actions": [string]}],
+  "prerequisites": [{"category": string, "items": [string]}],
+  "solution_approaches": [{"name": string, "description": string, "pros": [string], "cons": [string], "complexity": "Simple|Medium|Complex", "estimated_time": string, "best_for": string}],
+  "real_world_examples": [{"title": string, "description": string, "company": string, "link": string|null, "lessons_learned": [string]}],
+  "learning_references": [{"title": string, "url": string, "type": "Tutorial|Documentation|Guide|Course|Blog", "difficulty": "Beginner|Intermediate|Advanced"}],
+  "timeline": {"phase_name": "duration"},
+  "estimated_budget": string|null,
+  "next_steps": [string]
 }
-
-Be comprehensive, practical, and consider production-ready solutions. Think like an experienced architect."""
+Keep content practical and concise."""
 
 
 def generate_blueprint(problem_statement: str, context: Optional[str] = None) -> ProjectBlueprint:
     """Generate a project blueprint using Groq API"""
     
     try:
-        user_message = f"""Problem Statement: {problem_statement}"""
-        
-        if context:
-            user_message += f"\n\nAdditional Context: {context}"
+        user_message = f"Problem Statement: {problem_statement}"
+
+        if context and context.strip() and context.strip().lower() != "string":
+          user_message += f"\nAdditional Context: {context.strip()}"
         
         message = _run_non_stream_completion(user_message)
         if isinstance(message, str):
@@ -362,10 +291,10 @@ def generate_blueprint(problem_statement: str, context: Optional[str] = None) ->
 def generate_streaming_blueprint(problem_statement: str, context: Optional[str] = None):
     """Generate blueprint with streaming for real-time frontend updates"""
     
-    user_message = f"""Problem Statement: {problem_statement}"""
-    
-    if context:
-        user_message += f"\n\nAdditional Context: {context}"
+    user_message = f"Problem Statement: {problem_statement}"
+
+    if context and context.strip() and context.strip().lower() != "string":
+      user_message += f"\nAdditional Context: {context.strip()}"
     
     try:
         stream = _run_stream_completion(user_message)
