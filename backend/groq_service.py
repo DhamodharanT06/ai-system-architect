@@ -3,7 +3,13 @@ import logging
 from config import settings
 from models import ProjectBlueprint
 from typing import Optional, List
-from groq import Groq
+from urllib import request as urllib_request
+from urllib import error as urllib_error
+
+try:
+  from groq import Groq  # pyright: ignore[reportMissingImports]
+except Exception:
+  Groq = None
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,9 @@ def get_groq_client():
     return None
 
   try:
+    if Groq is None:
+      logger.warning("Groq SDK import unavailable in this environment")
+      return None
     _client = Groq(api_key=settings.groq_api_key)
     logger.info("Groq client initialized successfully")
     return _client
@@ -38,6 +47,46 @@ PREFERRED_CHAT_MODELS = [
 ]
 
 _cached_available_models: Optional[List[str]] = None
+
+
+def _run_non_stream_completion_http(model: str, user_message: str) -> str:
+  """Fallback: call Groq chat completions directly via HTTP."""
+  if not settings.groq_api_key or settings.groq_api_key.strip() == "":
+    raise RuntimeError("GROQ_API_KEY environment variable is not set or empty")
+
+  payload = {
+    "model": model,
+    "max_tokens": 4000,
+    "temperature": 0.2,
+    "messages": [
+      {"role": "system", "content": SYSTEM_PROMPT},
+      {"role": "user", "content": user_message},
+    ],
+  }
+
+  req = urllib_request.Request(
+    url="https://api.groq.com/openai/v1/chat/completions",
+    data=json.dumps(payload).encode("utf-8"),
+    headers={
+      "Authorization": f"Bearer {settings.groq_api_key}",
+      "Content-Type": "application/json",
+    },
+    method="POST",
+  )
+
+  try:
+    with urllib_request.urlopen(req, timeout=60) as response:
+      response_body = response.read().decode("utf-8")
+      data = json.loads(response_body)
+      content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+      if not content:
+        raise RuntimeError("Groq HTTP fallback returned empty content")
+      return content
+  except urllib_error.HTTPError as e:
+    body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+    raise RuntimeError(f"Groq HTTP fallback failed: {e.code} {body}") from e
+  except urllib_error.URLError as e:
+    raise RuntimeError(f"Groq HTTP fallback network error: {str(e)}") from e
 
 
 def _is_retryable_model_error(error: Exception) -> bool:
@@ -137,7 +186,8 @@ def _run_non_stream_completion(user_message: str):
       logger.info("Trying Groq model: %s", model)
       client = get_groq_client()
       if client is None:
-        raise RuntimeError("Groq client not initialized in this environment")
+        logger.warning("Groq SDK client unavailable; using direct HTTP fallback for model: %s", model)
+        return _run_non_stream_completion_http(model, user_message)
 
       logger.info("Making API call to Groq with model: %s", model)
       message = client.chat.completions.create(
@@ -295,7 +345,10 @@ def generate_blueprint(problem_statement: str, context: Optional[str] = None) ->
             user_message += f"\n\nAdditional Context: {context}"
         
         message = _run_non_stream_completion(user_message)
-        response_text = message.choices[0].message.content or ""
+        if isinstance(message, str):
+          response_text = message
+        else:
+          response_text = message.choices[0].message.content or ""
         if not response_text:
           raise ValueError("Model returned an empty response")
 
