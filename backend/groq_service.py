@@ -3,7 +3,6 @@ import logging
 from config import settings
 from models import ProjectBlueprint
 from typing import Optional, List
-from groq import Groq
 
 logger = logging.getLogger(__name__)
 
