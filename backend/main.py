@@ -24,13 +24,22 @@ app = FastAPI(
 )
 
 # Configure CORS
+allowed_origins = [
+    settings.frontend_url,
+    "https://ai-system-architect-ruby.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000", "http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+logger.info("CORS allowed origins: %s", allowed_origins)
 
 
 @app.get("/")
@@ -171,10 +180,7 @@ async def get_examples():
     }
 
 
-@app.options("/{full_path:path}")
-async def options_handler(full_path: str):
-    """Handle CORS preflight requests"""
-    return {}
+# Note: explicit OPTIONS route removed so CORSMiddleware handles preflight requests.
 
 
 if __name__ == "__main__":
