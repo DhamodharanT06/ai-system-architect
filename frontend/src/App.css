@@ -1,8 +1,8 @@
 .app {
   display: flex;
   height: 100vh;
-  background: #050507;
-  color: #f4f7fb;
+  background: var(--bg);
+  color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
     'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
     sans-serif;
@@ -20,8 +20,8 @@
   align-items: center;
   justify-content: space-between;
   padding: 18px 28px;
-  background: rgba(6, 8, 12, 0.88);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
   backdrop-filter: blur(12px);
   box-shadow: 0 10px 35px rgba(0, 0, 0, 0.45);
 }
@@ -74,8 +74,8 @@
 }
 
 .view-toggle:hover {
-  background: rgba(29, 78, 216, 0.22);
-  border-color: rgba(96, 165, 250, 0.45);
+  background: var(--accent-strong);
+  border-color: rgba(6,182,212,0.45);
 }
 
 .panel-toggle-btn {
@@ -118,8 +118,8 @@
 .panel {
   display: flex;
   flex-direction: column;
-  background: #0b1118;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 16px;
   overflow: hidden;
   backdrop-filter: blur(12px);
@@ -132,8 +132,8 @@
   align-items: center;
   justify-content: space-between;
   padding: 14px 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: #0d141d;
+  border-bottom: 1px solid var(--border);
+  background: #08121a;
 }
 
 .panel-head h3 {
@@ -157,16 +157,16 @@
   gap: 6px;
   padding: 6px 10px;
   border-radius: 8px;
-  border: 1px solid rgba(125, 211, 252, 0.45);
-  background: rgba(30, 64, 175, 0.28);
-  color: #dbeafe;
+  border: 1px solid rgba(6,182,212,0.45);
+  background: rgba(6,182,212,0.18);
+  color: var(--text);
   font-size: 11px;
   font-weight: 700;
   cursor: pointer;
 }
 
 .share-output-btn:hover {
-  background: rgba(37, 99, 235, 0.36);
+  background: rgba(6,182,212,0.28);
 }
 
 .share-status-toast {

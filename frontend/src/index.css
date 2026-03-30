@@ -4,10 +4,24 @@
   box-sizing: border-box;
 }
 
+:root{
+  --bg: #000000;
+  --surface: #071018;
+  --text: #e6f7f5;
+  --muted: #94a3b8;
+  --accent: #06b6d4; /* teal */
+  --accent-strong: rgba(6,182,212,0.45);
+  --success: #16a34a;
+  --border: rgba(255,255,255,0.06);
+  --scroll-track: #071018;
+  --scroll-thumb: #06b6d4;
+  --scroll-thumb-hover: #34d1c8;
+}
+
 body {
   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  background-color: #0a0e27;
-  color: #e0e0e0;
+  background-color: var(--bg);
+  color: var(--text);
   overflow-x: hidden;
 }
 
@@ -22,16 +36,16 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  background: #1a1f3a;
+  background: var(--scroll-track);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #6366f1;
+  background: var(--scroll-thumb);
   border-radius: 5px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #818cf8;
+  background: var(--scroll-thumb-hover);
 }
 
 /* Global Animations */
