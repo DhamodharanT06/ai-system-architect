@@ -18,9 +18,16 @@ def get_groq_client():
   if _client is not None:
     return _client
 
+  if not settings.groq_api_key or settings.groq_api_key.strip() == "":
+    logger.error("GROQ_API_KEY environment variable is not set or empty. Please set GROQ_API_KEY in your environment.")
+    _client = None
+    return None
+
   try:
     from groq import Groq
+    logger.info("Initializing Groq client with API key (first 8 chars): %s***", settings.groq_api_key[:8])
     _client = Groq(api_key=settings.groq_api_key)
+    logger.info("Groq client initialized successfully")
     return _client
   except TypeError as e:
     # Known incompatibility: underlying HTTP client signature mismatch.
