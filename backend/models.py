@@ -16,6 +16,9 @@ class TechStackItem(BaseModel):
     category: str = Field(..., description="Category (e.g., Backend, Frontend, Database)")
     reason: str = Field(..., description="Why this technology is chosen")
     version: Optional[str] = Field(None, description="Recommended version")
+    languages: Optional[List[str]] = Field(None, description="Programming languages used with this stack item")
+    frameworks: Optional[List[str]] = Field(None, description="Frameworks used with this technology")
+    modules: Optional[List[str]] = Field(None, description="Important modules/packages used")
 
 
 class ArchitectureComponent(BaseModel):

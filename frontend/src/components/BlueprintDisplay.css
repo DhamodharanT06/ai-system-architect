@@ -60,6 +60,38 @@
   font-weight: 600;
 }
 
+.section-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.section-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.section-download {
+  background: transparent;
+  color: #d7ecff;
+  border: 1px solid rgba(219, 234, 254, 0.12);
+  padding: 8px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.section-download.small {
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.section-download:hover {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(219, 234, 254, 0.22);
+}
+
 .section-header:hover {
   background: rgba(37, 99, 235, 0.22);
 }
@@ -73,6 +105,584 @@
 
 .section-content {
   padding: 18px;
+}
+
+.visual-title {
+  padding: 16px 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(90deg, rgba(37, 99, 235, 0.2), rgba(30, 64, 175, 0.05));
+}
+
+.mindmap-title {
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.mindmap-shell {
+  padding: 16px;
+}
+
+.mindmap-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+  align-items: stretch;
+}
+
+.mindmap-layout.no-detail .mindmap-canvas {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.mindmap-layout.has-detail {
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+}
+
+.mindmap-canvas {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  min-height: 340px;
+  height: auto;
+  border-radius: 16px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background:
+    radial-gradient(circle at center, rgba(148, 163, 184, 0.14), rgba(15, 23, 42, 0.35) 45%, rgba(2, 6, 23, 0.42) 100%),
+    repeating-radial-gradient(circle at center, rgba(255, 255, 255, 0.02) 0 1px, transparent 1px 38px);
+  overflow: hidden;
+}
+
+.mindmap-links {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.mindmap-line {
+  stroke: rgba(200, 220, 240, 0.88);
+  stroke-width: 2.4;
+}
+
+.mindmap-center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  min-width: 200px;
+  max-width: 280px;
+  text-align: center;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(147, 197, 253, 0.5);
+  background: rgba(15, 23, 42, 0.86);
+  box-shadow: 0 14px 30px rgba(2, 6, 23, 0.55);
+  z-index: 3;
+}
+
+.mindmap-center span {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: rgba(186, 230, 253, 0.82);
+  margin-bottom: 6px;
+}
+
+.mindmap-center strong {
+  color: #eff6ff;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.mindmap-node {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  min-width: 108px;
+  max-width: 170px;
+  text-align: center;
+  padding: 9px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #e7f2ff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(15, 23, 42, 0.82);
+  z-index: 2;
+  backdrop-filter: blur(4px);
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.mindmap-node:hover,
+.mindmap-node:focus {
+  transform: translate(-50%, -50%) scale(1.04);
+  box-shadow: 0 8px 20px rgba(2, 6, 23, 0.42);
+  outline: none;
+}
+
+/* Mobile responsiveness for mindmap */
+@media (max-width: 720px) {
+  .mindmap-canvas {
+    aspect-ratio: 4 / 3;
+    min-height: 260px;
+  }
+  .mindmap-node {
+    min-width: 84px;
+    max-width: 120px;
+    font-size: 11px;
+    padding: 7px 10px;
+  }
+  .mindmap-center {
+    min-width: 140px;
+    max-width: 200px;
+    padding: 10px 12px;
+  }
+  .mindmap-center strong {
+    font-size: 13px;
+  }
+  .mindmap-line {
+    stroke-width: 2.2;
+  }
+}
+
+@media (max-width: 420px) {
+  .mindmap-canvas {
+    aspect-ratio: 4 / 3;
+    min-height: 220px;
+  }
+  .mindmap-node {
+    min-width: 70px;
+    max-width: 110px;
+    font-size: 10px;
+    padding: 6px 8px;
+  }
+}
+
+.mindmap-detail-panel {
+  border-radius: 14px;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  background: rgba(7, 14, 28, 0.82);
+  padding: 14px;
+  color: #deebff;
+  max-height: 72vh;
+  overflow-y: auto;
+}
+
+.detail-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.detail-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.76);
+  color: #dbeafe;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.detail-close:hover {
+  background: rgba(220, 38, 38, 0.2);
+  border-color: rgba(248, 113, 113, 0.5);
+}
+
+.mindmap-detail-panel .detail-kicker {
+  margin: 0 0 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: rgba(186, 230, 253, 0.8);
+}
+
+.mindmap-detail-panel h4 {
+  margin: 0 0 10px;
+  font-size: 17px;
+  color: #eff6ff;
+}
+
+.mindmap-detail-panel .detail-badge {
+  display: inline-block;
+  margin-bottom: 10px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(147, 197, 253, 0.4);
+  color: #bfdbfe;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.mindmap-detail-panel p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: rgba(219, 234, 254, 0.9);
+}
+
+.mindmap-detail-panel ul {
+  margin: 10px 0 0 16px;
+  padding: 0;
+}
+
+.mindmap-detail-panel li {
+  margin-bottom: 6px;
+  color: rgba(219, 234, 254, 0.92);
+  font-size: 12px;
+}
+
+.flowchart-shell {
+  padding: 16px;
+}
+
+.flowchart-track {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 8px 4px;
+}
+
+.flowchart-item {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.flowchart-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  color: rgba(147, 197, 253, 0.95);
+  font-weight: 700;
+  min-width: 18px;
+}
+
+.flowchart-node {
+  min-width: 220px;
+  max-width: 280px;
+  border-radius: 12px;
+  border: 1px solid rgba(147, 197, 253, 0.35);
+  background: rgba(15, 23, 42, 0.72);
+  box-shadow: 0 10px 26px rgba(2, 6, 23, 0.35);
+  padding: 12px;
+}
+
+.flowchart-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: #c7dcff;
+  border: 1px solid rgba(147, 197, 253, 0.4);
+  background: rgba(37, 99, 235, 0.2);
+}
+
+.flowchart-node h4 {
+  margin: 10px 0 6px;
+  color: #eff6ff;
+  font-size: 14px;
+}
+
+.flowchart-node p {
+  margin: 0;
+  color: rgba(221, 234, 255, 0.82);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.flowchart-meta {
+  margin-top: 10px;
+  color: rgba(147, 197, 253, 0.95);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.flowchart-section-block {
+  margin-top: 10px;
+}
+
+.flowchart-section-block strong {
+  display: block;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  color: #dbeafe;
+  margin-bottom: 6px;
+}
+
+.flowchart-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.flowchart-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 211, 252, 0.4);
+  background: rgba(30, 64, 175, 0.2);
+  color: #dbeafe;
+  font-size: 10px;
+  padding: 3px 8px;
+}
+
+.flowchart-chip.stack {
+  border-color: rgba(74, 222, 128, 0.4);
+  background: rgba(22, 163, 74, 0.2);
+}
+
+.flowchart-chip.muted {
+  border-color: rgba(148, 163, 184, 0.35);
+  background: rgba(71, 85, 105, 0.28);
+}
+
+@media (max-width: 900px) {
+  .flowchart-node {
+    min-width: 190px;
+    max-width: 240px;
+  }
+}
+
+@media (max-width: 640px) {
+  .flowchart-track {
+    justify-content: center;
+  }
+  .flowchart-item {
+    width: 100%;
+    justify-content: center;
+  }
+  .flowchart-node {
+    width: calc(100% - 34px);
+    max-width: none;
+  }
+}
+
+.mindmap-node.frontend {
+  border-color: rgba(74, 222, 128, 0.6);
+}
+
+.mindmap-node.backend {
+  border-color: rgba(96, 165, 250, 0.6);
+}
+
+.mindmap-node.database {
+  border-color: rgba(251, 191, 36, 0.6);
+}
+
+.mindmap-node.external_api {
+  border-color: rgba(196, 181, 253, 0.6);
+}
+
+.mindmap-node.infrastructure {
+  border-color: rgba(125, 211, 252, 0.6);
+}
+
+.mindmap-node.tech {
+  border-color: rgba(125, 211, 252, 0.55);
+}
+
+.mindmap-node.prerequisite {
+  border-color: rgba(251, 191, 36, 0.55);
+}
+
+.mindmap-node.approach {
+  border-color: rgba(196, 181, 253, 0.55);
+}
+
+.flow-map {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px;
+  overflow-x: auto;
+}
+
+.flow-node {
+  min-width: 170px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.25);
+}
+
+.flow-node strong {
+  display: block;
+  color: #eef4ff;
+  font-size: 13px;
+  margin-top: 6px;
+}
+
+.flow-type {
+  display: inline-block;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(214, 228, 255, 0.78);
+}
+
+.flow-link {
+  color: rgba(166, 191, 235, 0.8);
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.flow-node.frontend {
+  border-color: rgba(34, 197, 94, 0.45);
+}
+
+.flow-node.backend {
+  border-color: rgba(59, 130, 246, 0.45);
+}
+
+.flow-node.database {
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.flow-node.external_api {
+  border-color: rgba(168, 85, 247, 0.45);
+}
+
+.flow-node.infrastructure {
+  border-color: rgba(14, 165, 233, 0.45);
+}
+
+.topic-graph {
+  padding: 18px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.topic-node {
+  border-radius: 999px;
+  border: 1px solid rgba(147, 197, 253, 0.4);
+  background: rgba(37, 99, 235, 0.16);
+  color: #dce9ff;
+  font-weight: 600;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.topic-node.size-1 {
+  font-size: 11px;
+  padding: 8px 10px;
+}
+
+.topic-node.size-2 {
+  font-size: 12px;
+  padding: 10px 13px;
+}
+
+.topic-node.size-3 {
+  font-size: 13px;
+  padding: 12px 15px;
+}
+
+.topic-node.size-4 {
+  font-size: 14px;
+  padding: 14px 17px;
+}
+
+@media (max-width: 920px) {
+  .mindmap-layout,
+  .mindmap-layout.has-detail {
+    grid-template-columns: 1fr;
+  }
+
+  .mindmap-canvas {
+    min-height: 300px;
+  }
+
+  .mindmap-node {
+    min-width: 92px;
+    max-width: 124px;
+    font-size: 10px;
+    padding: 6px 8px;
+  }
+
+  .mindmap-center {
+    min-width: 160px;
+    max-width: 220px;
+    padding: 10px 12px;
+  }
+
+  .flowchart-track {
+    flex-direction: column;
+    overflow-x: visible;
+  }
+
+  .flowchart-node {
+    min-width: 100%;
+    max-width: 100%;
+  }
+
+  .flowchart-arrow {
+    transform: rotate(90deg);
+    justify-content: flex-start;
+    padding-left: 8px;
+  }
+
+  .stack-summary-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.focus-grid-mode .section-content > .components-grid,
+.focus-grid-mode .section-content > .tech-stack-grid,
+.focus-grid-mode .section-content > .workflow-timeline,
+.focus-grid-mode .section-content > .prerequisites-list,
+.focus-grid-mode .section-content > .approaches-grid,
+.focus-grid-mode .section-content > .examples-list,
+.focus-grid-mode .section-content > .references-list,
+.focus-grid-mode .timeline-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 14px;
+}
+
+.focus-grid-mode .workflow-step {
+  display: block;
+  margin-bottom: 0;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.52);
+}
+
+.focus-grid-mode .step-number {
+  margin-bottom: 8px;
+}
+
+.focus-grid-mode .step-arrow {
+  display: none;
+}
+
+.focus-grid-mode .prerequisite-group,
+.focus-grid-mode .reference-item,
+.focus-grid-mode .example-card,
+.focus-grid-mode .tech-item,
+.focus-grid-mode .component-card,
+.focus-grid-mode .approach-card,
+.focus-grid-mode .timeline-item {
+  height: 100%;
 }
 
 /* Components Grid */
@@ -200,6 +810,26 @@
   gap: 14px;
 }
 
+.stack-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.stack-summary-card {
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.46);
+  padding: 10px;
+}
+
+.stack-summary-card h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: #e2e8f0;
+}
+
 .tech-item {
   padding: 16px;
   background: rgba(59, 130, 246, 0.08);
@@ -248,6 +878,44 @@
 .tech-version {
   font-size: 12px;
   color: #94a3b8;
+}
+
+.stack-meta-block {
+  margin-top: 10px;
+}
+
+.stack-meta-block strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #dbeafe;
+  font-size: 11px;
+}
+
+.stack-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.stack-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(125, 211, 252, 0.38);
+  background: rgba(30, 64, 175, 0.2);
+  color: #dbeafe;
+  font-size: 10px;
+  padding: 3px 8px;
+}
+
+.stack-chip.module {
+  border-color: rgba(74, 222, 128, 0.38);
+  background: rgba(21, 128, 61, 0.2);
+}
+
+.stack-chip.language {
+  border-color: rgba(251, 191, 36, 0.38);
+  background: rgba(146, 64, 14, 0.22);
 }
 
 /* Workflow */

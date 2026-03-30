@@ -1,10 +1,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { FiSend, FiMenu, FiX, FiGrid } from 'react-icons/fi';
+import { FiSend, FiGrid, FiMessageSquare, FiEdit3, FiMinimize2, FiMaximize2, FiShare2 } from 'react-icons/fi';
+import { toBlob } from 'html-to-image';
 import './App.css';
 import ChatMessage from './components/ChatMessage';
 import BlueprintDisplay from './components/BlueprintDisplay';
-import Sidebar from './components/Sidebar';
 import { generateBlueprint } from './services/api';
 
 function App() {
@@ -26,9 +26,13 @@ function App() {
 
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [currentBlueprint, setCurrentBlueprint] = useState(null);
+  const [showConversation, setShowConversation] = useState(true);
+  const [showComposer, setShowComposer] = useState(true);
+  const [shareMessage, setShareMessage] = useState('');
+  const [showWelcomeDialog, setShowWelcomeDialog] = useState(true);
   const messagesEndRef = useRef(null);
+  const outputCaptureRef = useRef(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -37,6 +41,49 @@ function App() {
   useEffect(() => {
     scrollToBottom();
   }, [messages]);
+
+  const handleShareOutput = async () => {
+    if (!currentBlueprint || !outputCaptureRef.current) return;
+
+    try {
+      const blob = await toBlob(outputCaptureRef.current, {
+        cacheBust: true,
+        pixelRatio: 2,
+        backgroundColor: '#0b1118',
+      });
+
+      if (!blob) {
+        setShareMessage('Unable to generate image. Try again.');
+        setTimeout(() => setShareMessage(''), 2500);
+        return;
+      }
+
+      const fileName = `${(currentBlueprint.project_name || 'architecture-output').replace(/\s+/g, '-').toLowerCase()}.png`;
+      const imageFile = new File([blob], fileName, { type: 'image/png' });
+
+      if (navigator.share && navigator.canShare && navigator.canShare({ files: [imageFile] })) {
+        await navigator.share({
+          title: `Blueprint: ${currentBlueprint.project_name}`,
+          files: [imageFile],
+        });
+        setShareMessage('Architecture image shared successfully.');
+      } else {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        setShareMessage('Architecture image downloaded.');
+      }
+    } catch (error) {
+      setShareMessage('Unable to share right now. Try again.');
+    }
+
+    setTimeout(() => setShareMessage(''), 2500);
+  };
 
   const handleSendMessage = async (e) => {
     e.preventDefault();
@@ -85,60 +132,102 @@ function App() {
 
   return (
     <div className="app">
-      <Sidebar isOpen={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-
       <main className="main-container">
         <header className="header">
-          <button
-            className="menu-toggle"
-            onClick={() => setSidebarOpen(!sidebarOpen)}
-          >
-            {sidebarOpen ? <FiX size={24} /> : <FiMenu size={24} />}
-          </button>
           <h1 className="title">
             <span className="title-text">AI System Architect</span>
           </h1>
-          <div className="header-spacer" />
+          <div className="view-controls">
+            <button
+              className="view-toggle"
+              onClick={() => setShowConversation((prev) => !prev)}
+              title={showConversation ? 'Hide conversation panel' : 'Show conversation panel'}
+            >
+              {showConversation ? <FiMinimize2 size={16} /> : <FiMessageSquare size={16} />}
+              <span>{showConversation ? 'Focus Output' : 'Show Chat'}</span>
+            </button>
+            <button
+              className="view-toggle"
+              onClick={() => setShowComposer((prev) => !prev)}
+              title={showComposer ? 'Hide input box' : 'Show input box'}
+            >
+              {showComposer ? <FiMinimize2 size={16} /> : <FiEdit3 size={16} />}
+              <span>{showComposer ? 'Hide Input' : 'Show Input'}</span>
+            </button>
+          </div>
         </header>
 
         <div className="content-wrapper">
-          <div className="workspace-grid">
-            <section className="chat-container panel">
-              <div className="panel-head">
-                <h3>Conversation</h3>
-              </div>
-              <div className="messages-area">
-                {messages.map((msg, index) => (
-                  <ChatMessage
-                    key={msg.id}
-                    message={msg}
-                    isLast={index === messages.length - 1}
-                  />
-                ))}
-                {isLoading && (
-                  <motion.div
-                    className="loading-indicator"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
+          <div className={`workspace-grid ${!showConversation ? 'conversation-hidden' : ''}`}>
+            {showConversation && (
+              <section className="chat-container panel">
+                <div className="panel-head">
+                  <h3>Conversation</h3>
+                  <button
+                    className="panel-toggle-btn"
+                    onClick={() => setShowConversation(false)}
+                    title="Hide conversation"
                   >
-                    <div className="typing-indicator">
-                      <span></span>
-                      <span></span>
-                      <span></span>
-                    </div>
-                    <p>Generating blueprint...</p>
-                  </motion.div>
-                )}
-                <div ref={messagesEndRef} />
-              </div>
-            </section>
+                    <FiMinimize2 size={15} />
+                  </button>
+                </div>
+                <div className="messages-area">
+                  {messages.map((msg, index) => (
+                    <ChatMessage
+                      key={msg.id}
+                      message={msg}
+                      isLast={index === messages.length - 1}
+                    />
+                  ))}
+                  {isLoading && (
+                    <motion.div
+                      className="loading-indicator"
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                    >
+                      <div className="typing-indicator">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                      </div>
+                      <p>Generating blueprint...</p>
+                    </motion.div>
+                  )}
+                  <div ref={messagesEndRef} />
+                </div>
+              </section>
+            )}
 
-            <section className="blueprint-panel panel">
+            <section ref={outputCaptureRef} className={`blueprint-panel panel ${!showConversation ? 'expanded' : ''}`}>
               <div className="panel-head">
                 <h3>Architecture Output</h3>
+                <div className="panel-head-actions">
+                  {currentBlueprint && (
+                    <button
+                      className="share-output-btn"
+                      onClick={handleShareOutput}
+                      title="Share architecture output"
+                    >
+                      <FiShare2 size={14} />
+                      <span>Share</span>
+                    </button>
+                  )}
+                  {!showConversation && (
+                    <button
+                      className="panel-toggle-btn"
+                      onClick={() => setShowConversation(true)}
+                      title="Show conversation"
+                    >
+                      <FiMaximize2 size={15} />
+                    </button>
+                  )}
+                </div>
               </div>
               {currentBlueprint ? (
-                <BlueprintDisplay blueprint={currentBlueprint} />
+                <BlueprintDisplay
+                  blueprint={currentBlueprint}
+                  isFocusMode={!showConversation}
+                />
               ) : (
                 <div className="empty-blueprint">
                   <div className="empty-icon-wrap">
@@ -159,28 +248,78 @@ function App() {
           </div>
         </div>
 
-        <div className="input-section">
-          <form onSubmit={handleSendMessage} className="input-form">
-            <input
-              type="text"
-              value={inputValue}
-              onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Describe your problem or project idea..."
-              disabled={isLoading}
-              className="input-field"
-            />
-            <button
-              type="submit"
-              disabled={isLoading || !inputValue.trim()}
-              className="send-button"
-            >
-              <FiSend size={20} />
-            </button>
-          </form>
-          <p className="hint-text">
-            💡 Tip: Be specific! Include your goals, constraints, and any preferences.
-          </p>
-        </div>
+        {showComposer ? (
+          <div className="input-section">
+            <div className="input-top-row">
+              <p className="hint-text">
+                Tip: Be specific and include goals, constraints, and preferences.
+              </p>
+              <button
+                className="collapse-input-btn"
+                onClick={() => setShowComposer(false)}
+                title="Hide input box"
+              >
+                <FiMinimize2 size={14} />
+                <span>Collapse</span>
+              </button>
+            </div>
+            <form onSubmit={handleSendMessage} className="input-form">
+              <input
+                type="text"
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                placeholder="Describe your problem or project idea..."
+                disabled={isLoading}
+                className="input-field"
+              />
+              <button
+                type="submit"
+                disabled={isLoading || !inputValue.trim()}
+                className="send-button"
+              >
+                <FiSend size={20} />
+              </button>
+            </form>
+          </div>
+        ) : (
+          <button
+            className="restore-input-fab"
+            onClick={() => setShowComposer(true)}
+            title="Show input box"
+          >
+            <FiEdit3 size={16} />
+            <span>Open Input</span>
+          </button>
+        )}
+        {shareMessage && <div className="share-status-toast">{shareMessage}</div>}
+
+        {showWelcomeDialog && (
+          <div className="welcome-dialog-overlay" role="dialog" aria-modal="true" aria-labelledby="welcome-dialog-title">
+            <div className="welcome-dialog-card">
+              <h2 id="welcome-dialog-title">Welcome to AI System Architect</h2>
+              <p>
+                This web app helps you quickly design complete software architecture from a project idea.
+                Instead of guessing the structure, you get a guided blueprint with clear implementation direction.
+              </p>
+              <div className="welcome-dialog-details">
+                <h3>Why this is useful</h3>
+                <ul>
+                  <li>Converts your idea into a full system plan: architecture, workflow, and implementation steps.</li>
+                  <li>Suggests practical tech stack choices with languages, frameworks, and modules.</li>
+                  <li>Shows dependencies and build sequence so development can start with less confusion.</li>
+                  <li>Makes collaboration easier by providing a shareable and downloadable visual output.</li>
+                  <li>Helps beginners and teams move from concept to execution faster.</li>
+                </ul>
+              </div>
+              <button
+                className="welcome-dialog-ok"
+                onClick={() => setShowWelcomeDialog(false)}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

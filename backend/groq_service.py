@@ -13,7 +13,7 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-MAX_RESPONSE_TOKENS = 1800
+MAX_RESPONSE_TOKENS = 2200
 
 # Groq client instance
 _client = None
@@ -51,6 +51,44 @@ PREFERRED_CHAT_MODELS = [
 _cached_available_models: Optional[List[str]] = None
 
 
+def _extract_first_json_object(text: str) -> Optional[str]:
+  """Best-effort extraction of the first complete JSON object from text."""
+  start = text.find("{")
+  if start == -1:
+    return None
+
+  depth = 0
+  in_string = False
+  escaped = False
+
+  for idx in range(start, len(text)):
+    ch = text[idx]
+
+    if escaped:
+      escaped = False
+      continue
+
+    if ch == "\\":
+      escaped = True
+      continue
+
+    if ch == '"':
+      in_string = not in_string
+      continue
+
+    if in_string:
+      continue
+
+    if ch == "{":
+      depth += 1
+    elif ch == "}":
+      depth -= 1
+      if depth == 0:
+        return text[start:idx + 1]
+
+  return None
+
+
 def _run_non_stream_completion_http(model: str, user_message: str) -> str:
   """Fallback: call Groq chat completions directly via HTTP."""
   if not settings.groq_api_key or settings.groq_api_key.strip() == "":
@@ -59,7 +97,7 @@ def _run_non_stream_completion_http(model: str, user_message: str) -> str:
   payload = {
     "model": model,
     "max_tokens": MAX_RESPONSE_TOKENS,
-    "temperature": 0.2,
+    "temperature": 0.15,
     "messages": [
       {"role": "system", "content": SYSTEM_PROMPT},
       {"role": "user", "content": user_message},
@@ -165,7 +203,14 @@ def _parse_blueprint_response(response_text: str, problem_statement: str) -> Pro
     else:
       json_str = response_text
 
-    blueprint_data = json.loads(json_str)
+    try:
+      blueprint_data = json.loads(json_str)
+    except json.JSONDecodeError:
+      extracted = _extract_first_json_object(response_text)
+      if not extracted:
+        raise
+      blueprint_data = json.loads(extracted)
+
     blueprint = ProjectBlueprint(**blueprint_data)
     logger.info("Successfully generated blueprint for: %s", problem_statement[:50])
     return blueprint
@@ -195,7 +240,7 @@ def _run_non_stream_completion(user_message: str):
       message = client.chat.completions.create(
         model=model,
         max_tokens=MAX_RESPONSE_TOKENS,
-        temperature=0.2,
+        temperature=0.15,
         messages=[
           {"role": "system", "content": SYSTEM_PROMPT},
           {"role": "user", "content": user_message},
@@ -228,7 +273,7 @@ def _run_stream_completion(user_message: str):
       return client.chat.completions.create(
         model=model,
         max_tokens=MAX_RESPONSE_TOKENS,
-        temperature=0.2,
+        temperature=0.15,
         messages=[
           {"role": "system", "content": SYSTEM_PROMPT},
           {"role": "user", "content": user_message},
@@ -245,13 +290,13 @@ def _run_stream_completion(user_message: str):
     f"No working Groq streaming model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
   )
 
-SYSTEM_PROMPT = """You are an AI system architect. Output ONLY valid JSON (no markdown) matching this schema exactly:
+SYSTEM_PROMPT = """You are an expert AI system architect. Output ONLY valid JSON (no markdown) matching this schema exactly:
 {
   "project_name": string,
   "description": string,
   "problem_statement": string,
   "system_architecture": [{"name": string, "type": "frontend|backend|database|external_api|infrastructure", "description": string, "responsibilities": [string], "technologies": [string]}],
-  "tech_stack": [{"name": string, "category": string, "reason": string, "version": string|null}],
+  "tech_stack": [{"name": string, "category": string, "reason": string, "version": string|null, "languages": [string], "frameworks": [string], "modules": [string]}],
   "workflow": [{"step_number": number, "title": string, "description": string, "components_involved": [string], "key_actions": [string]}],
   "prerequisites": [{"category": string, "items": [string]}],
   "solution_approaches": [{"name": string, "description": string, "pros": [string], "cons": [string], "complexity": "Simple|Medium|Complex", "estimated_time": string, "best_for": string}],
@@ -261,14 +306,26 @@ SYSTEM_PROMPT = """You are an AI system architect. Output ONLY valid JSON (no ma
   "estimated_budget": string|null,
   "next_steps": [string]
 }
-Keep content practical and concise."""
+Rules:
+- Target audience is beginners. Use simple language and practical explanations.
+- Keep medium detail level: complete but concise.
+- Workflow must be end-to-end with 7-10 steps, step_number strictly sequential from 1.
+- Each workflow step must include:
+  - 2+ components_involved
+  - 3-4 key_actions
+  - clear plain-language phase outcome.
+- Tech stack should be practical (8-12 items) and include frontend, backend, database, infrastructure, APIs, testing, CI/CD, and security.
+- For every tech_stack item, include languages, frameworks, and modules arrays with concrete names.
+- timeline should represent realistic phases from setup to launch.
+- next_steps must be actionable and beginner-friendly.
+- Keep output concise, implementation-ready, and easy to read."""
 
 
 def generate_blueprint(problem_statement: str, context: Optional[str] = None) -> ProjectBlueprint:
     """Generate a project blueprint using Groq API"""
     
     try:
-        user_message = f"Problem Statement: {problem_statement}"
+        user_message = f"Problem Statement: {problem_statement}\nAudience: Beginner developer who needs step-by-step implementation clarity."
 
         if context and context.strip() and context.strip().lower() != "string":
           user_message += f"\nAdditional Context: {context.strip()}"
@@ -281,7 +338,21 @@ def generate_blueprint(problem_statement: str, context: Optional[str] = None) ->
         if not response_text:
           raise ValueError("Model returned an empty response")
 
-        return _parse_blueprint_response(response_text, problem_statement)
+        try:
+          return _parse_blueprint_response(response_text, problem_statement)
+        except ValueError:
+          # One auto-retry with stricter formatting constraints for malformed JSON.
+          retry_message = (
+            user_message
+            + "\n\nIMPORTANT: Return ONLY valid JSON object. "
+              "No markdown, no explanations, no trailing text. "
+              "If content is long, shorten sentences but keep schema complete."
+          )
+          retry = _run_non_stream_completion(retry_message)
+          retry_text = retry if isinstance(retry, str) else (retry.choices[0].message.content or "")
+          if not retry_text:
+            raise ValueError("Model returned an empty response on retry")
+          return _parse_blueprint_response(retry_text, problem_statement)
             
     except Exception as e:
         logger.error(f"Error generating blueprint: {str(e)}")
@@ -291,7 +362,7 @@ def generate_blueprint(problem_statement: str, context: Optional[str] = None) ->
 def generate_streaming_blueprint(problem_statement: str, context: Optional[str] = None):
     """Generate blueprint with streaming for real-time frontend updates"""
     
-    user_message = f"Problem Statement: {problem_statement}"
+    user_message = f"Problem Statement: {problem_statement}\nAudience: Beginner developer who needs step-by-step implementation clarity."
 
     if context and context.strip() and context.strip().lower() != "string":
       user_message += f"\nAdditional Context: {context.strip()}"
