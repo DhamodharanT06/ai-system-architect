@@ -8,7 +8,10 @@ import asyncio
 
 from config import settings
 from models import UserMessage, ChatResponse, ChatMessage, ProjectBlueprint
-from groq_service import generate_blueprint, generate_streaming_blueprint
+# from groq_service import generate_blueprint, generate_streaming_blueprint
+from groq_service import generate_blueprint, generate_streaming_blueprint, generate_ui_preview
+
+# 2. Paste the @app.post("/api/preview") function from the snippet
 
 # Configure logging
 logging.basicConfig(
@@ -195,3 +198,23 @@ if __name__ == "__main__":
         port=settings.backend_port,
         reload=settings.debug
     )
+
+@app.post("/api/preview")
+async def generate_preview(request: UserMessage):
+    """
+    Generate a UI preview HTML for the given project blueprint context.
+    Calls the Groq LLM (via LangChain) to produce self-contained HTML+CSS.
+    """
+    if not request.problem_statement or len(request.problem_statement.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Problem statement cannot be empty")
+ 
+    try:
+        logger.info(f"Generating UI preview for: {request.problem_statement[:80]}")
+        html = generate_ui_preview(
+            project_name=request.problem_statement,
+            context=request.context
+        )
+        return {"html": html}
+    except Exception as e:
+        logger.exception(f"Error generating UI preview: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating preview: {str(e)}")
