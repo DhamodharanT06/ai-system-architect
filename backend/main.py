@@ -9,7 +9,8 @@ import asyncio
 from config import settings
 from models import UserMessage, ChatResponse, ChatMessage, ProjectBlueprint
 # from groq_service import generate_blueprint, generate_streaming_blueprint
-from groq_service import generate_blueprint, generate_streaming_blueprint, generate_ui_preview
+from groq_service import generate_blueprint, generate_runtime_flow, generate_streaming_blueprint, generate_ui_preview
+from rag_pipeline import RAGResult 
 
 # 2. Paste the @app.post("/api/preview") function from the snippet
 
@@ -218,3 +219,23 @@ async def generate_preview(request: UserMessage):
     except Exception as e:
         logger.exception(f"Error generating UI preview: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating preview: {str(e)}")
+    
+@app.post("/api/runtime-flow")
+async def generate_runtime_flow_endpoint(request: UserMessage):
+    """
+    Generate a runtime execution flow for the given project.
+    Returns a list of swimlane steps showing how the app runs at runtime.
+    """
+    if not request.problem_statement or len(request.problem_statement.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Problem statement cannot be empty")
+ 
+    try:
+        logger.info(f"Generating runtime flow for: {request.problem_statement[:80]}")
+        steps = generate_runtime_flow(
+            project_name=request.problem_statement,
+            context=request.context
+        )
+        return {"steps": steps}
+    except Exception as e:
+        logger.exception(f"Error generating runtime flow: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating runtime flow: {str(e)}")

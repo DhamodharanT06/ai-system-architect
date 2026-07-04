@@ -1,0 +1,421 @@
+/* ══════════════════════════════════════════
+   ExecutionFlow — Runtime Swimlane Diagram
+══════════════════════════════════════════ */
+
+.eflow-wrapper {
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Header ── */
+.eflow-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 18px 14px;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+
+.eflow-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.eflow-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.eflow-legend-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.eflow-header-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.eflow-action-btn {
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.08);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.16s;
+}
+
+.eflow-action-btn:hover {
+  color: var(--text);
+  border-color: rgba(6,182,212,0.3);
+  background: rgba(6,182,212,0.06);
+}
+
+/* ── Placeholder ── */
+.eflow-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  padding: 48px 32px;
+}
+
+.eflow-placeholder-icon {
+  font-size: 36px;
+  width: 64px;
+  height: 64px;
+  border-radius: 16px;
+  background: rgba(6,182,212,0.08);
+  border: 1px solid rgba(6,182,212,0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.eflow-placeholder h4 {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.eflow-placeholder p {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.6;
+  max-width: 400px;
+}
+
+.eflow-placeholder p strong {
+  color: var(--accent);
+}
+
+.eflow-generate-btn {
+  margin-top: 6px;
+  padding: 10px 28px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #000;
+  border: none;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s;
+  letter-spacing: 0.3px;
+}
+
+.eflow-generate-btn:hover {
+  background: #22d3ee;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(6,182,212,0.35);
+}
+
+/* ── Loading ── */
+.eflow-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 60px 32px;
+  color: var(--muted);
+}
+
+.eflow-loading-ring {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: 3px solid rgba(6,182,212,0.15);
+  border-top-color: var(--accent);
+  animation: eflow-spin 0.9s linear infinite;
+}
+
+@keyframes eflow-spin { to { transform: rotate(360deg); } }
+
+.eflow-loading p { font-size: 14px; color: var(--text); }
+.eflow-loading span { font-size: 12px; }
+
+/* ── Error ── */
+.eflow-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 40px;
+  text-align: center;
+}
+
+.eflow-error p {
+  color: #f87171;
+  font-size: 13px;
+  max-width: 360px;
+}
+
+.eflow-error button {
+  padding: 7px 18px;
+  border-radius: 6px;
+  border: 1px solid rgba(248,113,113,0.3);
+  background: transparent;
+  color: #f87171;
+  cursor: pointer;
+  font-size: 12px;
+  transition: all 0.16s;
+}
+
+.eflow-error button:hover { background: rgba(248,113,113,0.1); }
+
+/* ── Diagram ── */
+.eflow-diagram {
+  overflow-x: auto;
+  padding: 16px 12px 24px;
+}
+
+/* ── Grid ── */
+.eflow-grid {
+  display: grid;
+  min-width: 600px;
+  row-gap: 0;
+}
+
+/* ── Lane header row ── */
+.eflow-grid-badge-header {
+  /* badge spacer */
+}
+
+.eflow-lane-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  border-bottom: 2px solid;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-right: 1px solid rgba(255,255,255,0.04);
+}
+
+.eflow-lane-icon { font-size: 13px; }
+
+/* ── Badge column ── */
+.eflow-badge-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 16px;
+  position: relative;
+}
+
+.eflow-badge {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: 1.5px solid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  background: rgba(0,0,0,0.3);
+  flex-shrink: 0;
+  z-index: 1;
+}
+
+.eflow-badge-line {
+  width: 2px;
+  flex: 1;
+  min-height: 10px;
+  margin-top: 2px;
+  border-radius: 1px;
+}
+
+/* ── Cells ── */
+.eflow-cell {
+  padding: 8px 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-right: 1px solid rgba(255,255,255,0.035);
+  min-height: 72px;
+  position: relative;
+}
+
+.eflow-cell--primary {
+  z-index: 2;
+}
+
+/* ── Node ── */
+.eflow-node {
+  width: 100%;
+  max-width: 220px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  transition: filter 0.18s;
+}
+
+.eflow-node:hover { filter: brightness(1.1); }
+
+/* ── Shapes ── */
+.eflow-shape {
+  width: 100%;
+  border: 1.5px solid var(--node-color);
+  background: color-mix(in srgb, var(--node-color) 8%, transparent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 12px;
+  text-align: center;
+  transition: box-shadow 0.18s, background 0.18s;
+  position: relative;
+}
+
+.eflow-node--active .eflow-shape {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--node-color) 35%, transparent);
+  background: color-mix(in srgb, var(--node-color) 14%, transparent);
+}
+
+/* process → rounded rectangle */
+.eflow-shape--process { border-radius: 8px; }
+
+/* start / end → pill */
+.eflow-shape--start,
+.eflow-shape--end {
+  border-radius: 999px;
+  padding: 8px 18px;
+}
+
+/* decision → diamond via clip-path */
+.eflow-shape--decision {
+  border-radius: 6px;
+  clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+  padding: 14px 10px;
+  border: none;
+  /* border via box-shadow so clip-path doesn't cut it */
+  outline: 1.5px solid var(--node-color);
+  outline-offset: -1px;
+}
+
+.eflow-node-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--node-color);
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.eflow-node-hint {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
+/* ── Arrow target dot (cross-lane indicator) ── */
+.eflow-arrow-target {
+  font-size: 16px;
+  color: var(--node-color);
+  opacity: 0.5;
+}
+
+/* ── Connector between rows ── */
+.eflow-connector-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2px 0;
+  grid-column: 1;
+}
+
+.eflow-connector-spacer {
+  /* fills the lane columns during connector row */
+  border-right: 1px solid rgba(255,255,255,0.035);
+}
+
+.eflow-connector-line {
+  width: 2px;
+  height: 14px;
+  border-radius: 1px;
+}
+
+.eflow-connector-arrow {
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid;
+  margin-top: -1px;
+  opacity: 0.75;
+}
+
+/* ── Detail panel ── */
+.eflow-detail-badge-spacer {
+  grid-column: 1;
+}
+
+.eflow-detail-panel {
+  border-left: 3px solid;
+  /* background: rgba(255,255,255,0.025); */
+  padding: 12px 16px;
+  border-radius: 0 8px 8px 0;
+  /* overflow: hidden; */
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.eflow-detail-lane-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 20px;
+  border: 1px solid;
+  align-self: flex-start;
+  letter-spacing: 0.3px;
+}
+
+.eflow-detail-desc {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.eflow-detail-arrow-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.eflow-detail-arrow-target {
+  font-weight: 700;
+}
+
+.eflow-detail-arrow-label {
+  color: var(--muted);
+  font-style: italic;
+}
+
+/* ── Responsive ── */
+@media (max-width: 700px) {
+  .eflow-lane-header { font-size: 10px; padding: 6px 8px; }
+  .eflow-cell { min-height: 60px; padding: 6px 4px; }
+  .eflow-node-title { font-size: 11px; }
+}

@@ -96,3 +96,5 @@ class ChatMessage(BaseModel):
 class ChatResponse(BaseModel):
     message: ChatMessage
     blueprint: Optional[ProjectBlueprint] = None
+    rag_used:  bool = False
+    rag_source_count: int = 0
