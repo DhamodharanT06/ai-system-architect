@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
-import { FiChevronDown, FiChevronUp, FiX } from 'react-icons/fi';
+import { FiChevronDown, FiChevronUp, FiX, FiDownload } from 'react-icons/fi';
 import './BlueprintDisplay.css';
 import { toPng } from 'html-to-image';
+import JSZip from 'jszip';
 import ProjectPreview from './ProjectPreview';
 import LearningHub from './LearningHub';
 import ExecutionFlow from './ExecutionFlow';
@@ -88,6 +89,7 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
   const approachesRef = useRef(null);
   const examplesRef = useRef(null);
   const referencesRef = useRef(null);
+  const timelineRef = useRef(null);
 
   const architectureTechMap = new Map(
     (blueprint.system_architecture || []).map((component) => [
@@ -130,6 +132,80 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
     }
   };
 
+  const [zipping, setZipping] = useState(false);
+
+  const handleShareZip = async () => {
+    setZipping(true);
+
+    // Expand all collapsible sections first so their refs are mounted
+    setExpandedSections({
+      architecture: true,
+      techstack: true,
+      workflow: true,
+      prerequisites: true,
+      approaches: true,
+      examples: true,
+      references: true,
+    });
+
+    // Wait for DOM to render the newly expanded sections
+    await new Promise((r) => setTimeout(r, 600));
+
+    const slug = (blueprint.project_name || 'blueprint')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+
+    // All capturable sections: [ref, filename-slug]
+    const sections = [
+      [mindmapRef,        'project-mindmap'],
+      [architectureRef,   'system-architecture'],
+      [techstackRef,      'tech-stack'],
+      [workflowRef,       'workflow'],
+      [prerequisitesRef,  'prerequisites'],
+      [approachesRef,     'solution-approaches'],
+      [examplesRef,       'real-world-examples'],
+      [referencesRef,     'learning-references'],
+      [flowchartRef,      'execution-flow'],
+      [timelineRef,      'timeline-next-steps'],
+    ];
+
+    const zip = new JSZip();
+    const folder = zip.folder(slug);
+
+    for (const [ref, name] of sections) {
+      if (!ref?.current) continue;
+      try {
+        const dataUrl = await toPng(ref.current, {
+          cacheBust: true,
+          backgroundColor: '#0b1118',
+          pixelRatio: 2,
+        });
+        // dataUrl is "data:image/png;base64,..."
+        const base64 = dataUrl.split(',')[1];
+        folder.file(`${name}.png`, base64, { base64: true });
+      } catch (err) {
+        console.warn(`Skipped section "${name}":`, err.message);
+      }
+    }
+
+    try {
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url  = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href     = url;
+      link.download = `${slug}-blueprint.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Failed to generate ZIP:', err);
+    } finally {
+      setZipping(false);
+    }
+  };
+
   return (
     <motion.div
       className={`blueprint-container ${isFocusMode ? 'focus-grid-mode' : ''}`}
@@ -138,7 +214,27 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
       transition={{ duration: 0.3 }}
     >
       <div className="blueprint-header">
-        <h2 className="blueprint-title">{blueprint.project_name}</h2>
+        <div className="blueprint-header-top">
+          <h2 className="blueprint-title">{blueprint.project_name}</h2>
+          <button
+            className={`blueprint-share-btn ${zipping ? 'loading' : ''}`}
+            onClick={handleShareZip}
+            disabled={zipping}
+            title="Download all sections as ZIP"
+          >
+            {zipping ? (
+              <>
+                <span className="share-spinner" />
+                Zipping…
+              </>
+            ) : (
+              <>
+                <FiDownload size={14} />
+                Share / Export
+              </>
+            )}
+          </button>
+        </div>
         <p className="blueprint-description">{blueprint.description}</p>
       </div>
 
@@ -250,7 +346,7 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
           animate={{ opacity: 1 }}
         >
           <div className="section-header-row">
-            <h3 className="section-title visual-title">System Execution Flow</h3>
+            <h3 className="section-title visual-title">AI / System Execution Flow</h3>
           </div>
           <ExecutionFlow
             blueprint={blueprint}
@@ -575,6 +671,7 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
           </div>
           {expandedSections.references && (
             <motion.div
+              ref={referencesRef}
               className="section-content"
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
@@ -587,6 +684,7 @@ function BlueprintDisplay({ blueprint, isFocusMode = false }) {
 
         {/* Timeline & Next Steps */}
         <motion.div
+          ref={timelineRef}
           className="blueprint-section"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}

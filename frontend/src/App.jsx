@@ -6,6 +6,7 @@ import './App.css';
 import ChatMessage from './components/ChatMessage';
 import BlueprintDisplay from './components/BlueprintDisplay';
 import { generateBlueprint } from './services/api';
+import GenerationProgress from './components/GenerationProgress';
 
 function App() {
   const sampleIdeas = [
@@ -26,6 +27,7 @@ function App() {
 
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [generatingFor, setGeneratingFor] = useState('');
   const [currentBlueprint, setCurrentBlueprint] = useState(null);
   const [showConversation, setShowConversation] = useState(true);
   const [showComposer, setShowComposer] = useState(true);
@@ -101,6 +103,7 @@ function App() {
     setMessages((prev) => [...prev, userMessage]);
     setInputValue('');
     setIsLoading(true);
+    setGeneratingFor(inputValue);
 
     try {
       const response = await generateBlueprint(inputValue);
@@ -127,6 +130,7 @@ function App() {
       setMessages((prev) => [...prev, errorMessage]);
     } finally {
       setIsLoading(false);
+      setGeneratingFor('');
     }
   };
 
@@ -321,6 +325,11 @@ function App() {
           </div>
         )}
       </main>
+
+      <GenerationProgress
+        visible={isLoading}
+        projectName={generatingFor}
+      />
     </div>
   );
 }
