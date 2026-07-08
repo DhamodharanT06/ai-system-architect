@@ -8,6 +8,7 @@ import ProjectPreview from './ProjectPreview';
 import LearningHub from './LearningHub';
 import ExecutionFlow from './ExecutionFlow';
 
+
 function BlueprintDisplay({ blueprint, isFocusMode = false }) {
   const [expandedSections, setExpandedSections] = useState({
     architecture: true,
