@@ -206,7 +206,7 @@ function App() {
               <div className="panel-head">
                 <h3>Architecture Output</h3>
                 <div className="panel-head-actions">
-                  {currentBlueprint && (
+                  {/* {currentBlueprint && (
                     <button
                       className="share-output-btn"
                       onClick={handleShareOutput}
@@ -215,7 +215,8 @@ function App() {
                       <FiShare2 size={14} />
                       <span>Share</span>
                     </button>
-                  )}
+                  )} */}
+                  
                   {!showConversation && (
                     <button
                       className="panel-toggle-btn"

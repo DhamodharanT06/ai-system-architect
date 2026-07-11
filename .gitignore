@@ -54,6 +54,7 @@ frontend/.env.development.local
 frontend/.env.test.local
 frontend/.env.production.local
 backend/.env.local
+backend_no_rag/.env.local
 
 # OS
 .DS_Store
