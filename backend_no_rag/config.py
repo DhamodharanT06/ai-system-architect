@@ -7,6 +7,11 @@ class Settings(BaseSettings):
     # ── Groq ──────────────────────────────────────────────────────────────
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     groq_model:   str = os.getenv("GROQ_MODEL", "")
+    
+    # ── OpenRouter ───────────────────────────────────────────────────────
+    openrouter_api_key:    str  = os.getenv("OPENROUTER_API_KEY", "")
+    openrouter_model:      str  = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+    openrouter_enabled:    bool = os.getenv("OPENROUTER_ENABLED", "True").lower() == "true"
 
     # ── Server ────────────────────────────────────────────────────────────
     backend_port: int  = int(os.getenv("BACKEND_PORT", 8000))
