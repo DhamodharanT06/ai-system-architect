@@ -35,15 +35,17 @@ logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_TOKENS = 8000  # raised from 2200 — blueprints can exceed 4k tokens easily
 
-# Free Groq models (verified active as of 2026).
-# llama-2-70b-chat and mixtral-8x7b-32768 are decommissioned — removed.
+# Free Groq models (verified active as of July 2026).
+# Decommissioned and removed: llama-2-70b-chat, mixtral-8x7b-32768, gemma2-9b-it
+# Full list: https://console.groq.com/docs/models
 PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
     "llama-3.1-70b-versatile",
     "llama-3.1-8b-instant",
     "llama3-70b-8192",
     "llama3-8b-8192",
-    "gemma2-9b-it",
+    "llama-3.2-11b-text-preview",
+    "llama-3.2-3b-preview",
 ]
 
 _cached_available_models: Optional[List[str]] = None
@@ -404,6 +406,20 @@ def _run_non_stream_completion(user_message: str, use_rag_prompt: bool = False) 
                 f"OpenRouter error: {e}"
             ) from e
 
+    # All candidates were retryable (decommissioned) errors — treat as Groq unavailable
+    if last_error is not None and settings.openrouter_enabled and settings.openrouter_api_key:
+        logger.warning(
+            "All Groq models decommissioned/unavailable. "
+            "Falling back to OpenRouter: %s", settings.openrouter_model,
+        )
+        try:
+            return _invoke_openrouter(user_message, use_rag_prompt=use_rag_prompt)
+        except Exception as e:
+            logger.error("OpenRouter fallback also failed: %s", str(e))
+            raise RuntimeError(
+                f"All Groq models decommissioned and OpenRouter failed: {e}"
+            ) from e
+
     raise RuntimeError(
         f"No working Groq model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
     )
@@ -449,6 +465,15 @@ def _run_stream_completion(user_message: str):
         except Exception as e:
             logger.error("OpenRouter stream fallback failed: %s", e)
             raise RuntimeError(f"Groq rate-limited and OpenRouter failed: {e}") from e
+
+    # All Groq stream candidates decommissioned → fall back to OpenRouter non-streaming
+    if last_error is not None and settings.openrouter_enabled and settings.openrouter_api_key:
+        logger.warning("All Groq stream models unavailable — falling back to OpenRouter")
+        try:
+            full_text = _invoke_openrouter(user_message, use_rag_prompt=False)
+            return iter([full_text])
+        except Exception as e:
+            raise RuntimeError(f"Groq unavailable and OpenRouter failed: {e}") from e
 
     raise RuntimeError(
         f"No working streaming model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
