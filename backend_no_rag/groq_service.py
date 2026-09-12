@@ -35,11 +35,15 @@ logger = logging.getLogger(__name__)
 
 MAX_RESPONSE_TOKENS = 8000  # raised from 2200 — blueprints can exceed 4k tokens easily
 
+# Free Groq models (verified active as of 2026).
+# llama-2-70b-chat and mixtral-8x7b-32768 are decommissioned — removed.
 PREFERRED_CHAT_MODELS = [
     "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
     "llama-3.1-8b-instant",
-    "mixtral-8x7b-32768",
-    "llama-2-70b-chat",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "gemma2-9b-it",
 ]
 
 _cached_available_models: Optional[List[str]] = None
@@ -57,11 +61,16 @@ _GROQ_RATE_LIMIT_MARKERS = (
     "tokens per minute",
     "requests per minute",
     "tokens per day",
-    "context_length_exceeded",     # Groq sometimes raises this on overload
+    "context_length_exceeded",
     "503",
-    "529",                          # Groq overload status
+    "529",
     "service unavailable",
     "overloaded",
+    # Missing / invalid key — should fall back to OpenRouter immediately
+    "invalid api key",
+    "no api key",
+    "authentication",
+    "401",
 )
 
 
@@ -156,7 +165,15 @@ def _get_available_models() -> List[str]:
 
 
 def _get_model_candidates() -> List[str]:
-    """Build ordered model candidates from env + preferred defaults + discovered models."""
+    """
+    Build ordered model candidates from env + preferred defaults + live model list.
+    Returns empty list when no Groq key is set — callers will skip Stage 1
+    and go straight to OpenRouter.
+    """
+    if not settings.groq_api_key or not settings.groq_api_key.strip():
+        logger.info("No GROQ_API_KEY configured — skipping Groq, will use OpenRouter")
+        return []
+
     configured_model = settings.groq_model.strip() if settings.groq_model else ""
     available_models = _get_available_models()
 
@@ -170,9 +187,12 @@ def _get_model_candidates() -> List[str]:
             candidates.append(model)
 
     if available_models:
+        # Only keep models that Groq confirms exist — avoids 404 on decommissioned ones
         filtered = [m for m in candidates if m in available_models]
         if filtered:
             return filtered
+        # available_models non-empty but none of our preferred list matched →
+        # use whatever Groq lists (better than nothing)
         return available_models
 
     return candidates
@@ -340,6 +360,10 @@ def _run_non_stream_completion(user_message: str, use_rag_prompt: bool = False) 
     logger.info("Groq model candidates: %s", model_candidates)
 
     # ── Stage 1: Groq ────────────────────────────────────────────────────────
+    # If no candidates (no key or all decommissioned), skip straight to OR
+    if not model_candidates:
+        groq_rate_limited = True   # treat no-key as "Groq unavailable"
+
     for model in model_candidates:
         try:
             logger.info("Trying Groq model: %s", model)
@@ -395,7 +419,11 @@ def _run_stream_completion(user_message: str):
     groq_rate_limited                     = False
 
     # ── Stage 1: Groq streaming ──────────────────────────────────────────────
-    for model in _get_model_candidates():
+    stream_candidates = _get_model_candidates()
+    if not stream_candidates:
+        groq_rate_limited = True   # no key → skip to OpenRouter
+
+    for model in stream_candidates:
         try:
             logger.info("Trying Groq streaming model: %s", model)
             chain = _get_chain(model)
@@ -822,7 +850,11 @@ def generate_ui_preview(project_name: str, context: Optional[str] = None) -> str
         return cleaned.replace("```", "").strip()
 
     # ── Stage 1: Groq ────────────────────────────────────────────────────────
-    for model in _get_model_candidates():
+    ui_candidates = _get_model_candidates()
+    if not ui_candidates:
+        groq_rate_limited = True   # no key → skip to OpenRouter
+
+    for model in ui_candidates:
         try:
             logger.info("Generating UI preview with Groq model: %s", model)
             llm = ChatGroq(
@@ -960,7 +992,11 @@ def generate_runtime_flow(project_name: str, context: Optional[str] = None) -> l
         )
 
     # ── Stage 1: Groq ────────────────────────────────────────────────────────
-    for model in _get_model_candidates():
+    flow_candidates = _get_model_candidates()
+    if not flow_candidates:
+        groq_rate_limited = True   # no key → skip to OpenRouter
+
+    for model in flow_candidates:
         try:
             logger.info("Generating runtime flow with Groq model: %s", model)
             result = _make_groq_llm(model).invoke(user_message)
