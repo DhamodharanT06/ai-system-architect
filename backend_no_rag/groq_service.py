@@ -39,13 +39,8 @@ MAX_RESPONSE_TOKENS = 8000  # raised from 2200 — blueprints can exceed 4k toke
 # Decommissioned and removed: llama-2-70b-chat, mixtral-8x7b-32768, gemma2-9b-it
 # Full list: https://console.groq.com/docs/models
 PREFERRED_CHAT_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "llama-3.2-11b-text-preview",
-    "llama-3.2-3b-preview",
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
 ]
 
 _cached_available_models: Optional[List[str]] = None
