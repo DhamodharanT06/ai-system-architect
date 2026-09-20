@@ -1,102 +1,234 @@
+"""
+groq_service.py
+Optimized LLM service for ArchiMind.
+
+Architecture:
+    Blueprint generation = ONLY LLM operation.
+    Runtime Flow          = Python from cached Blueprint.
+    UI Preview            = Python from cached Blueprint.
+    Streaming             = cached Blueprint streamed in chunks.
+
+No Groq model candidates are used.
+OpenRouter `openrouter/free` is the only LLM route.
+
+Cache:
+    - process-local LRU/TTL cache
+    - duplicate concurrent requests for the same project are coalesced
+    - exact problem/context key is preferred
+    - project-name alias is used by /preview and /runtime-flow
+    - no endpoint changes are required
+
+Important Vercel note:
+    This cache is per warm serverless instance. It is not a shared persistent
+    cache between different Vercel instances.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import html
 import json
 import logging
+import os
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Tuple
+
 from config import settings
 from models import ProjectBlueprint, LearningReference
-from typing import Optional, List
-
-from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI          # used for OpenRouter (OpenAI-compatible)
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from rag_pipeline import (
-    run_rag_pipeline_sync,
-    RAGResult,
-    SourceDoc,
-)
-# Individual searchers imported for the search-only fallback
-from rag_pipeline import (
-    _search_arxiv,
-    _search_semantic_scholar,
-    _search_crossref,
-    _search_core,
-    _search_tavily,
-    _search_github,
-)
-
-# json-repair: recovers truncated/malformed JSON (trailing commas, missing braces, etc.)
-try:
-    from json_repair import repair_json
-    _JSON_REPAIR_AVAILABLE = True
-except ImportError:
-    _JSON_REPAIR_AVAILABLE = False
-    logger.warning("json-repair not installed — install with: pip install json-repair")
+from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
-MAX_RESPONSE_TOKENS = 8000  # raised from 2200 — blueprints can exceed 4k tokens easily
+# ============================================================================
+# CONFIG
+# ============================================================================
 
-# Free Groq models (verified active as of July 2026).
-# Decommissioned and removed: llama-2-70b-chat, mixtral-8x7b-32768, gemma2-9b-it
-# Full list: https://console.groq.com/docs/models
-PREFERRED_CHAT_MODELS = [
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-]
-
-_cached_available_models: Optional[List[str]] = None
-
-# OpenRouter endpoint (OpenAI-compatible)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Error substrings that specifically mean Groq is rate-limited / quota-exhausted.
-# These trigger OpenRouter fallback rather than retrying another Groq model.
-_GROQ_RATE_LIMIT_MARKERS = (
-    "rate_limit_exceeded",
-    "rate limit",
-    "quota exceeded",
-    "too many requests",
-    "tokens per minute",
-    "requests per minute",
-    "tokens per day",
-    "context_length_exceeded",
-    "503",
-    "529",
-    "service unavailable",
-    "overloaded",
-    # Missing / invalid key — should fall back to OpenRouter immediately
-    "invalid api key",
-    "no api key",
-    "authentication",
-    "401",
-)
+# Deliberately fixed: this prevents an old/paid model in .env from being used.
+OPENROUTER_FREE_MODEL = "openrouter/free"
+
+# Keep enough room for the complete blueprint, but do not reserve 8000 tokens.
+MAX_RESPONSE_TOKENS = int(os.getenv("BLUEPRINT_MAX_TOKENS", "5500"))
+
+CACHE_TTL_SECONDS = int(os.getenv("BLUEPRINT_CACHE_TTL", "1800"))  # 30 min
+CACHE_MAX_ENTRIES = int(os.getenv("BLUEPRINT_CACHE_MAX", "32"))
+STREAM_CHUNK_SIZE = 700
+
+# Search is ONLY used to collect links for learning_references.
+# Search content is NEVER sent to the LLM.
+SEARCH_TIMEOUT_SECONDS = 10
+
+# ============================================================================
+# BLUEPRINT CACHE
+# ============================================================================
+
+_cache_lock = threading.RLock()
+_blueprint_cache: "OrderedDict[str, Tuple[float, ProjectBlueprint]]" = OrderedDict()
+
+# Prevent two simultaneous requests for the same key from making two LLM calls.
+_inflight: Dict[str, threading.Event] = {}
 
 
-# -------------------------------------------------------------------------------------
-# Helpers (unchanged from original)
-# -------------------------------------------------------------------------------------
+def _normalise(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
+def _cache_key(problem_statement: str, context: Optional[str]) -> str:
+    return f"{_normalise(problem_statement)}::{_normalise(context)}"
+
+
+def _project_cache_key(project_name: str) -> str:
+    return f"project::{_normalise(project_name)}"
+
+
+def _clone_blueprint(blueprint: ProjectBlueprint) -> ProjectBlueprint:
+    """
+    Return a copy so callers cannot accidentally mutate the cached object.
+    Pydantic v2 -> model_copy(); fallback -> deepcopy.
+    """
+    try:
+        return blueprint.model_copy(deep=True)
+    except AttributeError:
+        return copy.deepcopy(blueprint)
+
+
+def _remove_expired_cache_entries() -> None:
+    now = time.time()
+    expired = [
+        key
+        for key, (created, _) in _blueprint_cache.items()
+        if now - created >= CACHE_TTL_SECONDS
+    ]
+    for key in expired:
+        _blueprint_cache.pop(key, None)
+
+
+def _get_cached_blueprint(
+    problem_statement: str,
+    context: Optional[str] = None,
+) -> Optional[ProjectBlueprint]:
+    """
+    Exact key first, then project-name alias.
+
+    The alias is useful because /preview and /runtime-flow normally receive
+    project_name rather than the original full problem statement.
+    """
+    exact_key = _cache_key(problem_statement, context)
+
+    with _cache_lock:
+        _remove_expired_cache_entries()
+
+        item = _blueprint_cache.get(exact_key)
+        if item:
+            _blueprint_cache.move_to_end(exact_key)
+            logger.info("Blueprint cache HIT: exact")
+            return _clone_blueprint(item[1])
+
+        project_key = _project_cache_key(problem_statement)
+        item = _blueprint_cache.get(project_key)
+        if item:
+            _blueprint_cache.move_to_end(project_key)
+            logger.info("Blueprint cache HIT: project alias")
+            return _clone_blueprint(item[1])
+
+    return None
+
+
+def _save_blueprint_to_cache(
+    problem_statement: str,
+    context: Optional[str],
+    blueprint: ProjectBlueprint,
+) -> None:
+    exact_key = _cache_key(problem_statement, context)
+    project_name = str(getattr(blueprint, "project_name", "") or problem_statement)
+    project_key = _project_cache_key(project_name)
+
+    value = _clone_blueprint(blueprint)
+    now = time.time()
+
+    with _cache_lock:
+        _blueprint_cache[exact_key] = (now, value)
+        _blueprint_cache.move_to_end(exact_key)
+
+        # Project alias points to the same logical blueprint.
+        _blueprint_cache[project_key] = (now, value)
+        _blueprint_cache.move_to_end(project_key)
+
+        # Remove oldest entries until the configured limit is respected.
+        while len(_blueprint_cache) > CACHE_MAX_ENTRIES:
+            _blueprint_cache.popitem(last=False)
+
+    logger.info(
+        "Blueprint cached: project=%s ttl=%ss entries=%d",
+        project_name,
+        CACHE_TTL_SECONDS,
+        len(_blueprint_cache),
+    )
+
+
+# ============================================================================
+# JSON PARSING
+# ============================================================================
+
+try:
+    from json_repair import repair_json
+
+    _JSON_REPAIR_AVAILABLE = True
+except ImportError:
+    repair_json = None
+    _JSON_REPAIR_AVAILABLE = False
+    logger.warning("json-repair is not installed; malformed JSON recovery disabled.")
+
+
+def _clean_json_str(raw: str) -> str:
+    text = (raw or "").strip()
+
+    if "```json" in text:
+        text = text.split("```json", 1)[1]
+        if "```" in text:
+            text = text.split("```", 1)[0]
+    elif text.startswith("```"):
+        text = text[3:]
+        if "```" in text:
+            text = text.split("```", 1)[0]
+
+    return text.strip()
+
 
 def _extract_first_json_object(text: str) -> Optional[str]:
-    """Best-effort extraction of the first complete JSON object from text."""
+    """
+    Extract the first complete JSON object while respecting quoted strings.
+    """
     start = text.find("{")
-    if start == -1:
+    if start < 0:
         return None
 
     depth = 0
     in_string = False
     escaped = False
 
-    for idx in range(start, len(text)):
-        ch = text[idx]
+    for i in range(start, len(text)):
+        ch = text[i]
 
         if escaped:
             escaped = False
             continue
+
         if ch == "\\":
             escaped = True
             continue
+
         if ch == '"':
             in_string = not in_string
             continue
+
         if in_string:
             continue
 
@@ -105,960 +237,1389 @@ def _extract_first_json_object(text: str) -> Optional[str]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return text[start:idx + 1]
+                return text[start : i + 1]
 
     return None
 
 
-def _is_retryable_model_error(error: Exception) -> bool:
-    """Return True when we should retry with another model."""
-    error_text = str(error).lower()
-    retry_markers = [
-        "model_decommissioned",
-        "no longer supported",
-        "decommissioned",
-        "model not found",
-        "does not exist",
-        "invalid_request_error",
-    ]
-    return any(marker in error_text for marker in retry_markers)
-
-
-def _is_groq_rate_limited(error: Exception) -> bool:
-    """Return True when Groq is rate-limiting or quota-exhausted — triggers OpenRouter fallback."""
-    error_text = str(error).lower()
-    return any(marker in error_text for marker in _GROQ_RATE_LIMIT_MARKERS)
-
-
-def _get_available_models() -> List[str]:
-    """Fetch available Groq model IDs once and cache them via LangChain."""
-    global _cached_available_models
-
-    if _cached_available_models is not None:
-        return _cached_available_models
-
-    try:
-        # Use a lightweight model just to query the model list via the Groq HTTP API
-        import urllib.request as urllib_request
-        import urllib.error as urllib_error
-
-        req = urllib_request.Request(
-            url="https://api.groq.com/openai/v1/models",
-            headers={
-                "Authorization": f"Bearer {settings.groq_api_key}",
-                "Content-Type": "application/json",
-            },
-            method="GET",
-        )
-        with urllib_request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            _cached_available_models = [m["id"] for m in data.get("data", []) if m.get("id")]
-            logger.info("Detected %s available Groq models", len(_cached_available_models))
-    except Exception as e:
-        logger.warning("Could not fetch model list from Groq: %s", str(e))
-        _cached_available_models = []
-
-    return _cached_available_models
-
-
-def _get_model_candidates() -> List[str]:
+def _parse_blueprint_response(
+    response_text: str,
+    problem_statement: str,
+) -> ProjectBlueprint:
     """
-    Build ordered model candidates from env + preferred defaults + live model list.
-    Returns empty list when no Groq key is set — callers will skip Stage 1
-    and go straight to OpenRouter.
+    Local parsing only.
+    IMPORTANT: this function never calls the LLM again.
     """
-    if not settings.groq_api_key or not settings.groq_api_key.strip():
-        logger.info("No GROQ_API_KEY configured — skipping Groq, will use OpenRouter")
-        return []
-
-    configured_model = settings.groq_model.strip() if settings.groq_model else ""
-    available_models = _get_available_models()
-
     candidates: List[str] = []
 
-    if configured_model:
-        candidates.append(configured_model)
+    cleaned = _clean_json_str(response_text)
+    if cleaned:
+        candidates.append(cleaned)
 
-    for model in PREFERRED_CHAT_MODELS:
-        if model not in candidates:
-            candidates.append(model)
-
-    if available_models:
-        # Only keep models that Groq confirms exist — avoids 404 on decommissioned ones
-        filtered = [m for m in candidates if m in available_models]
-        if filtered:
-            return filtered
-        # available_models non-empty but none of our preferred list matched →
-        # use whatever Groq lists (better than nothing)
-        return available_models
-
-    return candidates
-
-
-def _clean_json_str(raw: str) -> str:
-    """Strip markdown fences and leading/trailing noise from a raw model response."""
-    s = raw.strip()
-    # Remove ```json ... ``` or ``` ... ``` fences
-    if "```json" in s:
-        s = s.split("```json", 1)[1]
-        s = s.split("```", 1)[0] if "```" in s else s
-    elif s.startswith("```"):
-        s = s[3:]
-        s = s.split("```", 1)[0] if "```" in s else s
-    # Trim anything before the opening brace
-    brace = s.find("{")
-    if brace > 0:
-        s = s[brace:]
-    return s.strip()
-
-
-def _parse_blueprint_response(response_text: str, problem_statement: str) -> ProjectBlueprint:
-    """
-    Parse and validate JSON blueprint from model output.
-    Attempt order:
-      1. Direct json.loads after fence-stripping
-      2. _extract_first_json_object (brace-depth scan)
-      3. json-repair (recovers truncated / malformed JSON)
-    """
-    json_str = _clean_json_str(response_text)
-
-    # Attempt 1 — clean parse
-    try:
-        blueprint_data = json.loads(json_str)
-        blueprint = ProjectBlueprint(**blueprint_data)
-        logger.info("Blueprint parsed (direct) for: %s", problem_statement[:50])
-        return blueprint
-    except (json.JSONDecodeError, Exception):
-        pass
-
-    # Attempt 2 — brace-depth extraction
     extracted = _extract_first_json_object(response_text)
-    if extracted:
+    if extracted and extracted not in candidates:
+        candidates.append(extracted)
+
+    for candidate in candidates:
         try:
-            blueprint_data = json.loads(extracted)
-            blueprint = ProjectBlueprint(**blueprint_data)
-            logger.info("Blueprint parsed (extracted) for: %s", problem_statement[:50])
+            data = json.loads(candidate)
+            blueprint = ProjectBlueprint(**data)
+            logger.info(
+                "Blueprint parsed successfully for: %s",
+                problem_statement[:60],
+            )
             return blueprint
-        except (json.JSONDecodeError, Exception):
+        except Exception:
             pass
 
-    # Attempt 3 — json-repair (handles truncation, trailing commas, missing braces)
     if _JSON_REPAIR_AVAILABLE:
         try:
-            repaired = repair_json(json_str, return_objects=False)
-            blueprint_data = json.loads(repaired)
-            blueprint = ProjectBlueprint(**blueprint_data)
-            logger.info("Blueprint parsed (repaired) for: %s", problem_statement[:50])
+            repaired = repair_json(cleaned, return_objects=False)
+            data = json.loads(repaired)
+            blueprint = ProjectBlueprint(**data)
+            logger.info(
+                "Blueprint parsed using local json-repair for: %s",
+                problem_statement[:60],
+            )
             return blueprint
-        except Exception as e:
-            logger.error("json-repair also failed: %s", e)
+        except Exception as exc:
+            logger.error("Local json-repair failed: %s", exc)
 
-    logger.error("JSON parsing error — all 3 attempts failed")
-    logger.error("Response text (first 500 chars): %s", response_text[:500])
-    raise ValueError("Failed to parse blueprint JSON from Groq response")
-
-
-# -------------------------------------------------------------------------------------
-# LangChain chain factory
-# -------------------------------------------------------------------------------------
-
-def _get_chain(model: str, system_prompt: str = None):
-    """Build a LangChain chain: ChatPromptTemplate | ChatGroq | StrOutputParser."""
-    llm = ChatGroq(
-        api_key=settings.groq_api_key,
-        model_name=model,
-        temperature=0.15,
-        max_tokens=MAX_RESPONSE_TOKENS,
+    logger.error(
+        "Blueprint JSON parse failed. Response length=%d first500=%r",
+        len(response_text or ""),
+        (response_text or "")[:500],
     )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt or SYSTEM_PROMPT),
-        ("human", "{user_message}"),
-    ])
-    return prompt | llm | StrOutputParser()
-
-
-def _get_rag_chain(model: str):
-    """Chain that uses the RAG-augmented system prompt."""
-    llm = ChatGroq(
-        api_key=settings.groq_api_key,
-        model_name=model,
-        temperature=0.15,
-        max_tokens=MAX_RESPONSE_TOKENS,
+    raise ValueError(
+        "Failed to parse blueprint JSON from LLM response. "
+        "No second LLM call was made."
     )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", RAG_SYSTEM_PROMPT),
-        ("human", "{user_message}"),
-    ])
-    return prompt | llm | StrOutputParser()
 
 
-# -------------------------------------------------------------------------------------
-# OpenRouter chain factories  (identical interface to Groq chains)
-# -------------------------------------------------------------------------------------
+# ============================================================================
+# OPENROUTER - ONLY LLM
+# ============================================================================
 
-def _get_openrouter_chain(system_prompt: str = None):
-    """
-    Build a LangChain chain using OpenRouter as the backend.
-    OpenRouter exposes an OpenAI-compatible API so we use ChatOpenAI.
-    The model is set via settings.openrouter_model (default: free Llama tier).
-    """
-    if not settings.openrouter_api_key:
-        raise RuntimeError("OPENROUTER_API_KEY not configured — cannot use OpenRouter fallback")
+def _get_openrouter_llm() -> ChatOpenAI:
+    api_key = getattr(settings, "openrouter_api_key", None)
 
-    llm = ChatOpenAI(
-        api_key=settings.openrouter_api_key,
+    if not api_key:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not configured."
+        )
+
+    return ChatOpenAI(
+        api_key=api_key,
         base_url=OPENROUTER_BASE_URL,
-        model=settings.openrouter_model,
-        temperature=0.15,
+        model=OPENROUTER_FREE_MODEL,
+        temperature=0.1,
         max_tokens=MAX_RESPONSE_TOKENS,
         default_headers={
-            # Required by OpenRouter for analytics / rate-limit attribution
-            "HTTP-Referer": "https://ai-system-architect.app",
-            "X-Title":      "AI System Architect",
+            "HTTP-Referer": "https://ai-system-architect.vercel.app",
+            "X-Title": "ArchiMind",
         },
     )
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt or SYSTEM_PROMPT),
-        ("human", "{user_message}"),
-    ])
-    return prompt | llm | StrOutputParser()
 
 
-def _get_openrouter_rag_chain():
-    """OpenRouter chain with RAG system prompt."""
-    return _get_openrouter_chain(system_prompt=RAG_SYSTEM_PROMPT)
+# ============================================================================
+# SEARCH-ONLY REFERENCES
+# ============================================================================
 
-
-def _invoke_openrouter(user_message: str, use_rag_prompt: bool = False) -> str:
-    """Run a single completion via OpenRouter. Raises on any error."""
-    logger.info("Falling back to OpenRouter model: %s", settings.openrouter_model)
-    chain = _get_openrouter_rag_chain() if use_rag_prompt else _get_openrouter_chain()
-    result = chain.invoke({"user_message": user_message})
-    logger.info("OpenRouter completion succeeded")
-    return result
-
-
-# -------------------------------------------------------------------------------------
-# Internal completion runners
-# -------------------------------------------------------------------------------------
-
-def _run_non_stream_completion(user_message: str, use_rag_prompt: bool = False) -> str:
+def _search_sources_only(query: str) -> List[Any]:
     """
-    Run a non-streaming completion with two-stage fallback:
-      Stage 1 — Try each Groq model in candidate order.
-      Stage 2 — If ALL Groq models fail with rate-limit / quota / overload errors,
-                fall back to OpenRouter (if configured and enabled).
-    Any non-rate-limit error (bad request, auth error, etc.) raises immediately.
+    Search the existing six sources only to obtain links.
+
+    IMPORTANT:
+      - No embeddings.
+      - No FAISS.
+      - No SentenceTransformer.
+      - No retrieved text/context sent to the LLM.
+      - No RAG.
     """
-    last_error:          Optional[Exception] = None
-    groq_rate_limited                        = False   # True once any Groq model hits rate-limit
-
-    model_candidates = _get_model_candidates()
-    logger.info("Groq model candidates: %s", model_candidates)
-
-    # ── Stage 1: Groq ────────────────────────────────────────────────────────
-    # If no candidates (no key or all decommissioned), skip straight to OR
-    if not model_candidates:
-        groq_rate_limited = True   # treat no-key as "Groq unavailable"
-
-    for model in model_candidates:
-        try:
-            logger.info("Trying Groq model: %s", model)
-            chain  = _get_rag_chain(model) if use_rag_prompt else _get_chain(model)
-            result = chain.invoke({"user_message": user_message})
-            logger.info("Groq succeeded with model: %s", model)
-            return result
-
-        except Exception as e:
-            last_error = e
-            if _is_groq_rate_limited(e):
-                logger.warning(
-                    "Groq model %s rate-limited/quota: %s — trying next Groq model",
-                    model, str(e),
-                )
-                groq_rate_limited = True
-                continue   # try next Groq model before giving up on Groq
-            elif _is_retryable_model_error(e):
-                logger.warning("Groq model %s decommissioned: %s", model, str(e))
-                continue
-            else:
-                # Hard error (auth, bad request, etc.) — do not retry
-                logger.error("Groq model %s hard error: %s", model, str(e))
-                raise
-
-    # ── Stage 2: OpenRouter fallback ─────────────────────────────────────────
-    if groq_rate_limited and settings.openrouter_enabled and settings.openrouter_api_key:
-        logger.warning(
-            "All Groq models exhausted (rate-limit/quota). "
-            "Falling back to OpenRouter: %s", settings.openrouter_model,
+    try:
+        from rag_pipeline import (
+            _SourceStore,
+            _search_all,
         )
-        try:
-            return _invoke_openrouter(user_message, use_rag_prompt=use_rag_prompt)
-        except Exception as e:
-            logger.error("OpenRouter fallback also failed: %s", str(e))
-            raise RuntimeError(
-                f"Both Groq (rate-limited) and OpenRouter failed. "
-                f"OpenRouter error: {e}"
-            ) from e
+    except Exception as exc:
+        logger.warning("Search-only imports unavailable: %s", exc)
+        return []
 
-    # All candidates were retryable (decommissioned) errors — treat as Groq unavailable
-    if last_error is not None and settings.openrouter_enabled and settings.openrouter_api_key:
-        logger.warning(
-            "All Groq models decommissioned/unavailable. "
-            "Falling back to OpenRouter: %s", settings.openrouter_model,
+    store = _SourceStore()
+
+    def run() -> List[Any]:
+        return asyncio.run(
+            _search_all(
+                query=query,
+                store=store,
+                tavily_api_key=getattr(settings, "tavily_api_key", "") or "",
+                core_api_key=getattr(settings, "core_api_key", "") or "",
+                github_token=getattr(settings, "github_token", "") or "",
+            )
         )
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run)
+            docs = future.result(timeout=SEARCH_TIMEOUT_SECONDS)
+
+        logger.info("Search-only references collected: %d", len(docs))
+        return docs or []
+
+    except Exception as exc:
+        # The store may contain partial results even if a source timed out.
         try:
-            return _invoke_openrouter(user_message, use_rag_prompt=use_rag_prompt)
-        except Exception as e:
-            logger.error("OpenRouter fallback also failed: %s", str(e))
-            raise RuntimeError(
-                f"All Groq models decommissioned and OpenRouter failed: {e}"
-            ) from e
+            docs = store.get()
+        except Exception:
+            docs = []
 
-    raise RuntimeError(
-        f"No working Groq model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
-    )
-
-
-def _run_stream_completion(user_message: str):
-    """
-    Run a streaming completion with Groq→OpenRouter fallback.
-    If all Groq models are rate-limited, OpenRouter is called non-streaming
-    and its full response is yielded as a single chunk (transparent to callers).
-    """
-    last_error:       Optional[Exception] = None
-    groq_rate_limited                     = False
-
-    # ── Stage 1: Groq streaming ──────────────────────────────────────────────
-    stream_candidates = _get_model_candidates()
-    if not stream_candidates:
-        groq_rate_limited = True   # no key → skip to OpenRouter
-
-    for model in stream_candidates:
-        try:
-            logger.info("Trying Groq streaming model: %s", model)
-            chain = _get_chain(model)
-            return chain.stream({"user_message": user_message})
-        except Exception as e:
-            last_error = e
-            if _is_groq_rate_limited(e):
-                logger.warning("Groq stream model %s rate-limited: %s", model, str(e))
-                groq_rate_limited = True
-                continue
-            elif _is_retryable_model_error(e):
-                continue
-            else:
-                raise
-
-    # ── Stage 2: OpenRouter non-streaming → yield as single chunk ────────────
-    if groq_rate_limited and settings.openrouter_enabled and settings.openrouter_api_key:
-        logger.warning("Groq streaming exhausted — falling back to OpenRouter (non-streaming)")
-        try:
-            full_text = _invoke_openrouter(user_message, use_rag_prompt=False)
-            # Yield as an iterable with a single chunk — callers iterate over us
-            return iter([full_text])
-        except Exception as e:
-            logger.error("OpenRouter stream fallback failed: %s", e)
-            raise RuntimeError(f"Groq rate-limited and OpenRouter failed: {e}") from e
-
-    # All Groq stream candidates decommissioned → fall back to OpenRouter non-streaming
-    if last_error is not None and settings.openrouter_enabled and settings.openrouter_api_key:
-        logger.warning("All Groq stream models unavailable — falling back to OpenRouter")
-        try:
-            full_text = _invoke_openrouter(user_message, use_rag_prompt=False)
-            return iter([full_text])
-        except Exception as e:
-            raise RuntimeError(f"Groq unavailable and OpenRouter failed: {e}") from e
-
-    raise RuntimeError(
-        f"No working streaming model found. Last error: {str(last_error) if last_error else 'Unknown error'}"
-    )
+        logger.warning(
+            "Search-only collection failed/timeout: %s; partial=%d",
+            exc,
+            len(docs),
+        )
+        return docs
 
 
-# -------------------------------------------------------------------------------------
-# RAG helpers
-# -------------------------------------------------------------------------------------
-
-# Maps source → (ref_type, difficulty) for learning_references
 SOURCE_TYPE_MAP = {
-    "arxiv":            ("Research Paper",  "Advanced"),
-    "semantic_scholar": ("Research Paper",  "Advanced"),
-    "crossref":         ("Research Paper",  "Intermediate"),
-    "core":             ("Research Paper",  "Advanced"),
-    "tavily":           ("Guide",           "Beginner"),
-    "github":           ("Guide",           "Intermediate"),
+    "arxiv": ("Research Paper", "Advanced"),
+    "semantic_scholar": ("Research Paper", "Advanced"),
+    "crossref": ("Research Paper", "Intermediate"),
+    "core": ("Research Paper", "Advanced"),
+    "tavily": ("Guide", "Beginner"),
+    "github": ("Guide", "Intermediate"),
 }
 
-# Official/documentation domains get bumped to Documentation type
-DOC_DOMAIN_HINTS = [
-    "docs.", "documentation", "readthedocs", "developer.", "/api/",
-    "/reference/", "wiki.", "man.", "guide.", "learn.",
-]
+DOC_DOMAIN_HINTS = (
+    "docs.",
+    "documentation",
+    "readthedocs",
+    "developer.",
+    "/api/",
+    "/reference/",
+    "wiki.",
+    "man.",
+    "guide.",
+    "learn.",
+)
 
 
-def _infer_ref_type(doc: SourceDoc) -> tuple:
-    """Return (ref_type, difficulty) with doc_type + URL heuristics applied."""
-    base_type, difficulty = SOURCE_TYPE_MAP.get(doc.source, ("Guide", "Intermediate"))
+def _infer_ref_type(doc: Any) -> Tuple[str, str]:
+    source = getattr(doc, "source", "") or ""
+    ref_type, difficulty = SOURCE_TYPE_MAP.get(
+        source,
+        ("Guide", "Intermediate"),
+    )
 
-    # Tavily results that look like official docs → Documentation
-    if doc.source == "tavily" and hasattr(doc, "doc_type"):
-        if doc.doc_type == "documentation":
-            return ("Documentation", "Intermediate")
+    doc_type = getattr(doc, "doc_type", "") or ""
+    if source == "tavily" and doc_type == "documentation":
+        return "Documentation", "Intermediate"
 
-    # URL-based hint for any source
-    url_lower = (doc.url or "").lower()
-    if any(hint in url_lower for hint in DOC_DOMAIN_HINTS):
-        return ("Documentation", "Intermediate")
+    url = str(getattr(doc, "url", "") or "").lower()
+    if any(hint in url for hint in DOC_DOMAIN_HINTS):
+        return "Documentation", "Intermediate"
 
-    return (base_type, difficulty)
+    return ref_type, difficulty
 
 
-def _sources_to_learning_references(sources: List[SourceDoc]) -> List[dict]:
+def _sources_to_learning_references(
+    sources: List[Any],
+) -> List[LearningReference]:
     """
-    Convert ALL RAG SourceDoc objects → learning_references dicts.
-    Sources are sorted: papers first, then docs, then repos/web.
-    All sources are always included regardless of whether they were sent to the LLM.
+    Convert search results into the same LearningReference objects used by
+    the existing API response.
     """
-    # Sort: priority descending (papers=10, docs bumped, github=4)
-    sorted_sources = sorted(sources, key=lambda d: -getattr(d, "priority", 5))
+    seen = set()
+    refs: List[LearningReference] = []
 
-    refs = []
-    seen: set = set()
-    for doc in sorted_sources:
-        if not doc.url or doc.url in seen:
+    sources = sorted(
+        sources,
+        key=lambda d: -int(getattr(d, "priority", 5) or 5),
+    )
+
+    for doc in sources:
+        url = str(getattr(doc, "url", "") or "").strip()
+        if not url or url in seen:
             continue
-        seen.add(doc.url)
+
+        seen.add(url)
+
+        title = str(getattr(doc, "title", "") or "").strip()
+        if not title:
+            title = "Learning Resource"
 
         ref_type, difficulty = _infer_ref_type(doc)
 
-        # Build a rich title: include authors + year if available
-        title = doc.title or doc.url
-        meta_parts = []
-        if hasattr(doc, "authors") and doc.authors:
-            meta_parts.append(doc.authors[0] + (" et al." if len(doc.authors) > 1 else ""))
-        if hasattr(doc, "year") and doc.year:
-            meta_parts.append(doc.year)
-        if meta_parts:
-            title = f"{title} ({', '.join(meta_parts)})"
+        try:
+            refs.append(
+                LearningReference(
+                    title=title[:300],
+                    url=url,
+                    type=ref_type,
+                    difficulty=difficulty,
+                )
+            )
+        except Exception:
+            # If the model enum in models.py is stricter than the search
+            # metadata, fall back to a guaranteed schema value.
+            try:
+                refs.append(
+                    LearningReference(
+                        title=title[:300],
+                        url=url,
+                        type="Guide",
+                        difficulty=difficulty,
+                    )
+                )
+            except Exception:
+                continue
 
-        refs.append({
-            "title":      title,
-            "url":        doc.url,
-            "type":       ref_type,
-            "difficulty": difficulty,
-        })
     return refs
 
 
-def _build_user_message(problem_statement: str, context: Optional[str], rag_context: str = "") -> str:
-    parts = [f"Problem Statement: {problem_statement}"]
-    if context and context.strip() and context.strip().lower() != "string":
-        parts.append(f"Additional Context: {context.strip()}")
-    if rag_context:
-        parts.append(
-            "\n--- RESEARCH CONTEXT ---\n"
-            "The following excerpts are from real research papers, documentation, and repositories "
-            "(Semantic Scholar, arXiv, CrossRef, CORE, Tavily, GitHub). "
-            "Each excerpt begins with [SOURCE] Title (Year) — Author.\n\n"
-            f"{rag_context}\n--- END RESEARCH CONTEXT ---"
-        )
-    parts.append("Audience: Beginner developer who needs step-by-step implementation clarity.")
-    return "\n".join(parts)
-
-
-# -------------------------------------------------------------------------------------
-# Search-only fallback  (no embed/FAISS — just collect source links)
-# -------------------------------------------------------------------------------------
-
-def _search_only_fallback(
-    query: str,
-    tavily_api_key: str = "",
-    core_api_key:   str = "",
-    github_token:   str = "",
-) -> RAGResult:
+def _attach_learning_references(
+    blueprint: ProjectBlueprint,
+    sources: List[Any],
+) -> ProjectBlueprint:
     """
-    Lightweight fallback: run all 6 searchers concurrently, return their links
-    as sources without embedding or retrieval.  Used when the full RAG pipeline
-    crashes so learning_references are always populated.
+    Backend owns learning_references.
+    The LLM is asked to return [] so it does not waste output tokens or invent
+    links.
     """
-    import asyncio
-    import concurrent.futures
-    import httpx
+    refs = _sources_to_learning_references(sources)
 
-    async def _run():
-        async with httpx.AsyncClient(
-            headers={"User-Agent": "AISystemArchitect/2.0 search-fallback"},
-            follow_redirects=True,
-        ) as client:
-            results = await asyncio.gather(
-                _search_arxiv(query, client),
-                _search_semantic_scholar(query, client),
-                _search_crossref(query, client),
-                _search_core(query, client, core_api_key),
-                _search_tavily(query, client, tavily_api_key),
-                _search_github(query, client, github_token),
-                return_exceptions=True,
-            )
-        docs: List[SourceDoc] = []
-        seen: set = set()
-        for r in results:
-            if isinstance(r, list):
-                for doc in r:
-                    if doc.url and doc.url not in seen:
-                        seen.add(doc.url)
-                        docs.append(doc)
-        return docs
-
-    def _run_in_thread():
-        return asyncio.run(_run())
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        sources = pool.submit(_run_in_thread).result(timeout=30)
-
-    return RAGResult(context="", sources=sources, used_rag=False)
-
-
-# -------------------------------------------------------------------------------------
-# Public API (same signatures as original — main.py stays untouched)
-# -------------------------------------------------------------------------------------
-
-def generate_blueprint(problem_statement: str, context: Optional[str] = None) -> ProjectBlueprint:
-    """
-    Generate a project blueprint using RAG pipeline + LangChain + Groq.
-
-    Pipeline:
-      1. Run RAG (Semantic Scholar, arXiv, CrossRef, CORE, Tavily, GitHub)
-      2. If RAG found reliable sources → inject top-k chunks into prompt
-      3. If RAG found < MIN_RELIABLE_SOURCES → fall back to prompt-only
-      4. Merge RAG source URLs into learning_references of the returned blueprint
-    """
-    # ── Step 1: RAG ──────────────────────────────────────────────────────
-    rag_result = RAGResult(context="", sources=[], used_rag=False)
-    if settings.rag_enabled:
-        try:
-            logger.info("Running RAG pipeline for: %s", problem_statement[:60])
-            rag_result = run_rag_pipeline_sync(
-                query=problem_statement,
-                tavily_api_key=settings.tavily_api_key,
-                core_api_key=settings.core_api_key,
-                github_token=settings.github_token,
-            )
-            if rag_result.used_rag:
-                logger.info(
-                    "RAG succeeded: %d sources, %d chunks",
-                    rag_result.source_count, rag_result.chunk_count,
-                )
-            else:
-                logger.info("RAG fell back to prompt-only (insufficient sources)")
-        except Exception as e:
-            logger.warning("RAG pipeline error (continuing without RAG): %s", e)
-            # Full pipeline crashed — run lightweight search-only fallback
-            # so we still collect source links for learning_references
-            try:
-                rag_result = _search_only_fallback(
-                    problem_statement,
-                    tavily_api_key=settings.tavily_api_key,
-                    core_api_key=settings.core_api_key,
-                    github_token=settings.github_token,
-                )
-                logger.info(
-                    "Search-only fallback collected %d source links",
-                    len(rag_result.sources),
-                )
-            except Exception as e2:
-                logger.warning("Search-only fallback also failed: %s", e2)
-
-    # ── Step 2: build prompt ─────────────────────────────────────────────
     try:
-        user_message = _build_user_message(
-            problem_statement, context,
-            rag_context=rag_result.context if rag_result.used_rag else "",
-        )
+        blueprint.learning_references = refs
+    except Exception:
+        logger.warning("Could not replace learning_references on blueprint.")
 
-        response_text = _run_non_stream_completion(
-            user_message,
-            use_rag_prompt=rag_result.used_rag,
-        )
-        if not response_text:
-            raise ValueError("Model returned an empty response")
-
-        try:
-            blueprint = _parse_blueprint_response(response_text, problem_statement)
-        except ValueError:
-            retry_message = (
-                user_message
-                + "\n\nIMPORTANT: Return ONLY valid JSON object. "
-                  "No markdown, no explanations, no trailing text. "
-                  "If content is long, shorten sentences but keep schema complete."
-            )
-            retry_text = _run_non_stream_completion(
-                retry_message,
-                use_rag_prompt=rag_result.used_rag,
-            )
-            if not retry_text:
-                raise ValueError("Model returned an empty response on retry")
-            blueprint = _parse_blueprint_response(retry_text, problem_statement)
-
-        # ── Step 3: always merge ALL discovered sources into learning_references
-        # This runs whether RAG was used for context or not — every fetched link
-        # (arXiv, Semantic Scholar, CrossRef, CORE, Tavily, GitHub) is surfaced.
-        if rag_result.sources:
-            rag_refs = _sources_to_learning_references(rag_result.sources)
-            existing_urls = {r.url for r in (blueprint.learning_references or [])}
-            new_refs_data = [r for r in rag_refs if r["url"] not in existing_urls]
-            if new_refs_data:
-                from models import LearningReference
-                new_refs = [LearningReference(**r) for r in new_refs_data]
-                # Place RAG sources FIRST so they appear at the top of the section
-                blueprint.learning_references = new_refs + list(blueprint.learning_references or [])
-                logger.info(
-                    "Merged %d source links into learning_references (rag_used=%s)",
-                    len(new_refs), rag_result.used_rag,
-                )
-        else:
-            logger.info("No RAG sources collected — learning_references unchanged")
-
-        return blueprint
-
-    except Exception as e:
-        logger.error("Error generating blueprint: %s", str(e))
-        raise
+    logger.info(
+        "Learning references attached: %d (rag_used=False)",
+        len(refs),
+    )
+    return blueprint
 
 
-def generate_streaming_blueprint(problem_statement: str, context: Optional[str] = None):
-    """Generate blueprint with streaming (prompt-only — RAG runs separately in /api/generate)."""
+# ============================================================================
+# PROMPT
+# ============================================================================
+
+SYSTEM_PROMPT = """
+You are ArchiMind, an expert software system architect.
+
+Return ONLY one valid JSON object matching this schema:
+
+{
+  "project_name": string,
+  "description": string,
+  "problem_statement": string,
+  "system_architecture": [
+    {
+      "name": string,
+      "type": "frontend|backend|database|external_api|infrastructure",
+      "description": string,
+      "responsibilities": [string],
+      "technologies": [string]
+    }
+  ],
+  "tech_stack": [
+    {
+      "name": string,
+      "category": string,
+      "reason": string,
+      "version": string|null,
+      "languages": [string],
+      "frameworks": [string],
+      "modules": [string]
+    }
+  ],
+  "workflow": [
+    {
+      "step_number": number,
+      "title": string,
+      "description": string,
+      "components_involved": [string],
+      "key_actions": [string]
+    }
+  ],
+  "prerequisites": [
+    {
+      "category": string,
+      "items": [string]
+    }
+  ],
+  "solution_approaches": [
+    {
+      "name": string,
+      "description": string,
+      "pros": [string],
+      "cons": [string],
+      "complexity": "Simple|Medium|Complex",
+      "estimated_time": string,
+      "best_for": string
+    }
+  ],
+  "real_world_examples": [
+    {
+      "title": string,
+      "description": string,
+      "company": string,
+      "link": string|null,
+      "lessons_learned": [string]
+    }
+  ],
+  "learning_references": [],
+  "timeline": {
+      "phase_name": "duration"
+  },
+  "estimated_budget": string|null,
+  "next_steps": [string]
+}
+
+Rules:
+- Output JSON only. No markdown and no explanation.
+- Target beginners.
+- Keep the answer medium-detail and implementation-ready.
+- Workflow must contain 7-10 sequential steps.
+- Each workflow step has 2+ components and 3-4 key actions.
+- Tech stack should contain roughly 8-12 practical technologies.
+- Include frontend, backend, database, APIs, infrastructure, testing,
+  CI/CD and security when appropriate.
+- Keep descriptions concise.
+- learning_references MUST be [] because the backend adds real source links.
+- Do not invent research links.
+"""
+
+# ============================================================================
+# CENTRALIZED BLUEPRINT CREATION
+# ============================================================================
+
+def _build_user_message(
+    problem_statement: str,
+    context: Optional[str],
+) -> str:
+    extra = ""
+    if context and context.strip() and context.strip().lower() != "string":
+        extra = f"\nAdditional context:\n{context.strip()}"
+
+    return (
+        f"Project/problem request:\n{problem_statement.strip()}"
+        f"{extra}\n\n"
+        "Create the complete architecture blueprint now."
+    )
+
+
+def _call_llm_for_blueprint(
+    problem_statement: str,
+    context: Optional[str],
+) -> ProjectBlueprint:
+    """
+    THIS IS THE ONLY FUNCTION in this file that calls an LLM.
+    """
     user_message = _build_user_message(problem_statement, context)
-    try:
-        stream = _run_stream_completion(user_message)
-        for chunk in stream:
-            if chunk:
-                yield chunk
-    except Exception as e:
-        logger.error("Error in streaming blueprint: %s", str(e))
-        raise
 
-
-# -------------------------------------------------------------------------------------
-# System prompt (unchanged)
-# -------------------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """You are an expert AI system architect. Output ONLY valid JSON (no markdown) matching this schema exactly:
-{{
-  "project_name": string,
-  "description": string,
-  "problem_statement": string,
-  "system_architecture": [{{"name": string, "type": "frontend|backend|database|external_api|infrastructure", "description": string, "responsibilities": [string], "technologies": [string]}}],
-  "tech_stack": [{{"name": string, "category": string, "reason": string, "version": string|null, "languages": [string], "frameworks": [string], "modules": [string]}}],
-  "workflow": [{{"step_number": number, "title": string, "description": string, "components_involved": [string], "key_actions": [string]}}],
-  "prerequisites": [{{"category": string, "items": [string]}}],
-  "solution_approaches": [{{"name": string, "description": string, "pros": [string], "cons": [string], "complexity": "Simple|Medium|Complex", "estimated_time": string, "best_for": string}}],
-  "real_world_examples": [{{"title": string, "description": string, "company": string, "link": string|null, "lessons_learned": [string]}}],
-  "learning_references": [{{"title": string, "url": string, "type": "Tutorial|Documentation|Guide|Course|Blog", "difficulty": "Beginner|Intermediate|Advanced"}}],
-  "timeline": {{"phase_name": "duration"}},
-  "estimated_budget": string|null,
-  "next_steps": [string]
-}}
-Rules:
-- Target audience is beginners. Use simple language and practical explanations.
-- Keep medium detail level: complete but concise.
-- Workflow must be end-to-end with 7-10 steps, step_number strictly sequential from 1.
-- Each workflow step must include:
-  - 2+ components_involved
-  - 3-4 key_actions
-  - clear plain-language phase outcome.
-- Tech stack should be practical (8-12 items) and include frontend, backend, database, infrastructure, APIs, testing, CI/CD, and security.
-- For every tech_stack item, include languages, frameworks, and modules arrays with concrete names.
-- timeline should represent realistic phases from setup to launch.
-- next_steps must be actionable and beginner-friendly.
-- Keep output concise, implementation-ready, and easy to read."""
-
-
-# -------------------------------------------------------------------------------------
-# RAG-augmented system prompt (used when research context is available)
-# -------------------------------------------------------------------------------------
-
-RAG_SYSTEM_PROMPT = """You are an expert AI system architect with access to real research papers, official documentation, and open-source repositories retrieved via MMR search. Output ONLY valid JSON (no markdown) matching this schema exactly:
-{{
-  "project_name": string,
-  "description": string,
-  "problem_statement": string,
-  "system_architecture": [{{"name": string, "type": "frontend|backend|database|external_api|infrastructure", "description": string, "responsibilities": [string], "technologies": [string]}}],
-  "tech_stack": [{{"name": string, "category": string, "reason": string, "version": string|null, "languages": [string], "frameworks": [string], "modules": [string]}}],
-  "workflow": [{{"step_number": number, "title": string, "description": string, "components_involved": [string], "key_actions": [string]}}],
-  "prerequisites": [{{"category": string, "items": [string]}}],
-  "solution_approaches": [{{"name": string, "description": string, "pros": [string], "cons": [string], "complexity": "Simple|Medium|Complex", "estimated_time": string, "best_for": string}}],
-  "real_world_examples": [{{"title": string, "description": string, "company": string, "link": string|null, "lessons_learned": [string]}}],
-  "learning_references": [{{"title": string, "url": string, "type": "Tutorial|Documentation|Guide|Course|Blog|Research Paper", "difficulty": "Beginner|Intermediate|Advanced"}}],
-  "timeline": {{"phase_name": "duration"}},
-  "estimated_budget": string|null,
-  "next_steps": [string]
-}}
-Research context rules:
-- The RESEARCH CONTEXT in the user message contains MMR-selected excerpts from real papers, docs, and repos.
-- Each excerpt is prefixed with [SOURCE] Title (Year) — Author.
-- Prioritise insights from [ARXIV], [SEMANTIC_SCHOLAR], [CORE] papers over other sources.
-- Use [TAVILY] documentation excerpts for official API/framework guidance.
-- Use [GITHUB] README excerpts for real implementation patterns.
-- Ground tech stack "reason" fields in what the research context says, not general knowledge.
-- If a solution approach is supported by a paper, mention its key finding in the "description".
-
-Blueprint rules:
-- Target audience is beginners. Use simple language and practical explanations.
-- Workflow must be end-to-end with 7-10 steps, step_number strictly sequential from 1.
-- Each step: 2+ components_involved, 3-4 key_actions, clear phase outcome.
-- Tech stack: 8-12 items covering frontend, backend, database, infra, APIs, testing, CI/CD, security.
-- For every tech_stack item include languages, frameworks, and modules arrays with concrete names.
-- timeline: realistic phases from setup to launch.
-- next_steps: actionable and beginner-friendly.
-- Keep output concise, implementation-ready, and easy to read."""
-
-
-# -------------------------------------------------------------------------------------
-# UI Preview prompt & function
-# -------------------------------------------------------------------------------------
-
-UI_PREVIEW_PROMPT = """You are a senior UI/UX engineer. Generate a FULLY INTERACTIVE, production-quality web app for this project.
-
-Project: {project_name}
-{extra_context}
-
-Output ONLY raw HTML — no markdown, no triple-backtick fences, no explanation. A single complete HTML file.
-
-INTERACTIVITY REQUIREMENTS (mandatory):
-- The app must be fully functional and interactive using vanilla JS inside a <script> tag.
-- All buttons, inputs, forms, and controls must actually work — clicking, adding, deleting, editing, toggling, filtering, etc.
-- Use realistic in-memory data (arrays/objects in JS) to power the UI. Pre-populate with 4-6 sample records relevant to the project.
-- Implement the core user flows of the app: e.g. for a todo app — add task, mark complete, delete, filter; for a dashboard — clickable nav sections, live stats; for a chat app — send message, receive reply, etc.
-- All state changes must visually update the DOM immediately with no page reload.
-
-UI/DESIGN REQUIREMENTS:
-- Dark theme: background #0b1118, surface #0f1923, accent #06b6d4, text #e6f7f5, muted #64748b.
-- Clean sidebar or top nav with active state highlighting on click.
-- Main content area with cards, lists, or tables showing real data.
-- Smooth CSS transitions on interactions (hover, active, open/close).
-- Import one Google Font via @import in the <style> tag.
-- Responsive layout using CSS flexbox or grid.
-- html and body fill 100% height/width, overflow hidden on outer shell.
-
-TECHNICAL REQUIREMENTS:
-- All CSS in a single <style> block, all JS in a single <script> block at the bottom of <body>.
-- No external libraries (no jQuery, no React, no CDN imports).
-- Use document.querySelector / addEventListener / createElement for all DOM manipulation.
-- Keep JS clean and well-structured with named functions."""
-
-
-def generate_ui_preview(project_name: str, context: Optional[str] = None) -> str:
-    """Generate a self-contained HTML UI mockup for the given project using LangChain + Groq."""
-
-    extra_context = ""
-    if context and context.strip() and context.strip().lower() != "string":
-        extra_context = f"Additional context: {context.strip()}"
-
-    user_message = UI_PREVIEW_PROMPT.format(
-        project_name=project_name,
-        extra_context=extra_context,
+    logger.info(
+        "LLM CALL: OpenRouter/%s for blueprint: %s",
+        OPENROUTER_FREE_MODEL,
+        problem_statement[:70],
     )
 
-    last_error:       Optional[Exception] = None
-    groq_rate_limited                     = False
+    llm = _get_openrouter_llm()
 
-    def _clean_html(raw: str) -> str:
-        cleaned = raw
-        for fence in ("```html", "```"):
-            if fence in cleaned:
-                cleaned = cleaned.split(fence, 1)[-1]
-        return cleaned.replace("```", "").strip()
-
-    # ── Stage 1: Groq ────────────────────────────────────────────────────────
-    ui_candidates = _get_model_candidates()
-    if not ui_candidates:
-        groq_rate_limited = True   # no key → skip to OpenRouter
-
-    for model in ui_candidates:
-        try:
-            logger.info("Generating UI preview with Groq model: %s", model)
-            llm = ChatGroq(
-                api_key=settings.groq_api_key,
-                model_name=model,
-                temperature=0.4,
-                max_tokens=4000,
-            )
-            result  = llm.invoke(user_message)
-            raw     = result.content if hasattr(result, "content") else str(result)
-            cleaned = _clean_html(raw)
-            if not cleaned or "<" not in cleaned:
-                raise ValueError("Model returned non-HTML output")
-            logger.info("UI preview generated with Groq model: %s", model)
-            return cleaned
-        except Exception as e:
-            last_error = e
-            if _is_groq_rate_limited(e):
-                logger.warning("Groq UI preview rate-limited (%s): %s", model, e)
-                groq_rate_limited = True
-                continue
-            elif _is_retryable_model_error(e):
-                continue
-            else:
-                raise
-
-    # ── Stage 2: OpenRouter fallback ─────────────────────────────────────────
-    if groq_rate_limited and settings.openrouter_enabled and settings.openrouter_api_key:
-        try:
-            logger.warning("UI preview falling back to OpenRouter: %s", settings.openrouter_model)
-            llm = ChatOpenAI(
-                api_key=settings.openrouter_api_key,
-                base_url=OPENROUTER_BASE_URL,
-                model=settings.openrouter_model,
-                temperature=0.4,
-                max_tokens=4000,
-                default_headers={
-                    "HTTP-Referer": "https://ai-system-architect.app",
-                    "X-Title":      "AI System Architect",
-                },
-            )
-            result  = llm.invoke(user_message)
-            raw     = result.content if hasattr(result, "content") else str(result)
-            cleaned = _clean_html(raw)
-            if not cleaned or "<" not in cleaned:
-                raise ValueError("OpenRouter returned non-HTML output")
-            logger.info("UI preview generated via OpenRouter")
-            return cleaned
-        except Exception as e:
-            logger.error("OpenRouter UI preview fallback failed: %s", e)
-            raise RuntimeError(f"UI preview failed on both Groq and OpenRouter: {e}") from e
-
-    raise RuntimeError(
-        f"No working model for UI preview. Last error: {str(last_error) if last_error else 'Unknown'}"
+    # One and only one LLM invocation.
+    result = llm.invoke(
+        [
+            ("system", SYSTEM_PROMPT),
+            ("human", user_message),
+        ]
     )
 
+    raw = result.content if hasattr(result, "content") else str(result)
 
-# -------------------------------------------------------------------------------------
-# Runtime Flow prompt & function
-# -------------------------------------------------------------------------------------
-
-RUNTIME_FLOW_PROMPT = """You are a software architect. Generate a runtime execution flow for this application.
-
-Project: {project_name}
-{extra_context}
-
-CRITICAL: Show how the app RUNS at runtime — the journey from a user action to the final output.
-Do NOT describe the development process, SDLC, deployment steps, or how the blueprint was generated.
-
-Example for a Todo App: User clicks "Add Task" → Frontend captures input → API call to backend → Backend validates → DB insert → Response to frontend → UI updates with new task.
-
-Output ONLY a valid JSON array (no markdown, no fences). Each element:
-{{
-  "lane": "user|frontend|backend|ai|database|output",
-  "type": "start|process|decision|end",
-  "title": "short node label (max 6 words)",
-  "detail": "one sentence explaining what happens at this step in runtime",
-  "arrowTo": "lane id this step passes control to next (or null)",
-  "arrowLabel": "short label for the arrow e.g. HTTP POST /api/todos (or null)"
-}}
-
-Rules:
-- Always start with lane "user", type "start".
-- Always end with lane "output", type "end".
-- Include 8 to 14 steps total.
-- Use "decision" type for conditional logic (auth check, validation, cache hit, etc.).
-- Each step must be a real runtime event, not a development task.
-- arrowTo should be the lane of the NEXT step (helps draw cross-lane arrows).
-- Keep "title" very short — it appears inside a diagram node.
-- "detail" should explain the actual runtime mechanics: what data moves, what function runs, what protocol is used.
-- Use the actual tech stack of the project in the detail fields."""
-
-
-def generate_runtime_flow(project_name: str, context: Optional[str] = None) -> list:
-    """Generate runtime execution flow steps using LangChain + Groq."""
-
-    extra_context = ""
-    if context and context.strip() and context.strip().lower() != "string":
-        extra_context = f"Tech/Context: {context.strip()}"
-
-    user_message = RUNTIME_FLOW_PROMPT.format(
-        project_name=project_name,
-        extra_context=extra_context,
-    )
-
-    last_error:       Optional[Exception] = None
-    groq_rate_limited                     = False
-
-    valid_lanes = {"user", "frontend", "backend", "ai", "database", "output"}
-    valid_types = {"start", "process", "decision", "end"}
-
-    def _parse_and_sanitise(raw: str) -> list:
-        cleaned = raw
-        for fence in ("```json", "```"):
-            if fence in cleaned:
-                cleaned = cleaned.split(fence, 1)[-1]
-        cleaned = cleaned.replace("```", "").strip()
-        steps   = json.loads(cleaned)
-        if not isinstance(steps, list) or not steps:
-            raise ValueError("Expected a non-empty JSON array")
-        for s in steps:
-            s["lane"] = s.get("lane", "backend") if s.get("lane") in valid_lanes else "backend"
-            s["type"] = s.get("type", "process") if s.get("type") in valid_types else "process"
-            s.setdefault("arrowTo",    None)
-            s.setdefault("arrowLabel", None)
-            s.setdefault("detail",     s.get("title", ""))
-        return steps
-
-    def _make_groq_llm(model: str):
-        return ChatGroq(
-            api_key=settings.groq_api_key,
-            model_name=model,
-            temperature=0.2,
-            max_tokens=2000,
+    if isinstance(raw, list):
+        raw = "".join(
+            item.get("text", str(item))
+            if isinstance(item, dict)
+            else str(item)
+            for item in raw
         )
 
-    # ── Stage 1: Groq ────────────────────────────────────────────────────────
-    flow_candidates = _get_model_candidates()
-    if not flow_candidates:
-        groq_rate_limited = True   # no key → skip to OpenRouter
+    raw = str(raw).strip()
 
-    for model in flow_candidates:
-        try:
-            logger.info("Generating runtime flow with Groq model: %s", model)
-            result = _make_groq_llm(model).invoke(user_message)
-            raw    = result.content if hasattr(result, "content") else str(result)
-            steps  = _parse_and_sanitise(raw)
-            logger.info("Runtime flow generated: %d steps with Groq %s", len(steps), model)
-            return steps
-        except Exception as e:
-            last_error = e
-            if _is_groq_rate_limited(e):
-                logger.warning("Groq flow rate-limited (%s): %s", model, e)
-                groq_rate_limited = True
-                continue
-            elif _is_retryable_model_error(e):
-                continue
-            else:
-                raise
+    if not raw:
+        raise ValueError("LLM returned an empty blueprint response.")
 
-    # ── Stage 2: OpenRouter fallback ─────────────────────────────────────────
-    if groq_rate_limited and settings.openrouter_enabled and settings.openrouter_api_key:
+    return _parse_blueprint_response(raw, problem_statement)
+
+
+def _get_or_create_blueprint(
+    problem_statement: str,
+    context: Optional[str] = None,
+) -> ProjectBlueprint:
+    """
+    CENTRAL GATEWAY.
+
+    Every public generation function goes through this function.
+
+    Cache HIT:
+        no LLM call.
+
+    Cache MISS:
+        exactly one LLM call, then cache the result.
+
+    Concurrent identical requests:
+        one request becomes the creator; others wait and then read the cache.
+    """
+    if not problem_statement or not problem_statement.strip():
+        raise ValueError("Project/problem statement cannot be empty.")
+
+    cached = _get_cached_blueprint(problem_statement, context)
+    if cached is not None:
+        return cached
+
+    key = _cache_key(problem_statement, context)
+
+    with _cache_lock:
+        event = _inflight.get(key)
+
+        if event is None:
+            event = threading.Event()
+            _inflight[key] = event
+            is_creator = True
+        else:
+            is_creator = False
+
+    if not is_creator:
+        logger.info("Waiting for in-flight blueprint: %s", problem_statement[:60])
+
+        # Wait for the request that owns this key.
+        event.wait(timeout=120)
+
+        cached = _get_cached_blueprint(problem_statement, context)
+        if cached is not None:
+            return cached
+
+        raise RuntimeError(
+            "Blueprint creation did not complete successfully."
+        )
+
+    try:
+        logger.info(
+            "Blueprint cache MISS: %s",
+            problem_statement[:70],
+        )
+
+        # Only this path performs the LLM call.
+        blueprint = _call_llm_for_blueprint(
+            problem_statement,
+            context,
+        )
+
+        # Search-only references are fetched after the blueprint is created.
+        # They are NOT passed to the LLM.
         try:
-            logger.warning("Runtime flow falling back to OpenRouter: %s", settings.openrouter_model)
-            llm = ChatOpenAI(
-                api_key=settings.openrouter_api_key,
-                base_url=OPENROUTER_BASE_URL,
-                model=settings.openrouter_model,
-                temperature=0.2,
-                max_tokens=2000,
-                default_headers={
-                    "HTTP-Referer": "https://ai-system-architect.app",
-                    "X-Title":      "AI System Architect",
-                },
+            sources = _search_sources_only(
+                getattr(blueprint, "problem_statement", None)
+                or problem_statement
             )
-            result = llm.invoke(user_message)
-            raw    = result.content if hasattr(result, "content") else str(result)
-            steps  = _parse_and_sanitise(raw)
-            logger.info("Runtime flow generated via OpenRouter: %d steps", len(steps))
-            return steps
-        except Exception as e:
-            logger.error("OpenRouter flow fallback failed: %s", e)
-            raise RuntimeError(f"Runtime flow failed on both Groq and OpenRouter: {e}") from e
+            blueprint = _attach_learning_references(
+                blueprint,
+                sources,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Learning-reference search failed; blueprint still valid: %s",
+                exc,
+            )
 
-    raise RuntimeError(
-        f"No working model for runtime flow. Last error: {str(last_error) if last_error else 'Unknown'}"
+        _save_blueprint_to_cache(
+            problem_statement,
+            context,
+            blueprint,
+        )
+
+        return _clone_blueprint(blueprint)
+
+    finally:
+        with _cache_lock:
+            owner_event = _inflight.pop(key, None)
+            if owner_event:
+                owner_event.set()
+
+
+# ============================================================================
+# PUBLIC API #1 - KEEP EXISTING ENDPOINT FUNCTION
+# ============================================================================
+
+def generate_blueprint(
+    problem_statement: str,
+    context: Optional[str] = None,
+) -> ProjectBlueprint:
+    """
+    Existing /api/generate entry point.
+
+    Cache HIT -> no LLM.
+    Cache MISS -> one LLM call.
+    """
+    return _get_or_create_blueprint(
+        problem_statement,
+        context,
     )
+
+
+# ============================================================================
+# PUBLIC API #2 - KEEP EXISTING STREAMING FUNCTION
+# ============================================================================
+
+def generate_streaming_blueprint(
+    problem_statement: str,
+    context: Optional[str] = None,
+):
+    """
+    Existing streaming entry point.
+
+    It does NOT make a separate streaming LLM call.
+
+    On cache MISS:
+        one normal blueprint LLM call -> cache.
+
+    On cache HIT:
+        zero LLM calls.
+
+    The cached/created blueprint JSON is then yielded in chunks so the existing
+    streaming endpoint can keep consuming an iterator.
+    """
+    blueprint = _get_or_create_blueprint(
+        problem_statement,
+        context,
+    )
+
+    try:
+        payload = blueprint.model_dump_json()
+    except AttributeError:
+        payload = blueprint.json()
+
+    for start in range(0, len(payload), STREAM_CHUNK_SIZE):
+        yield payload[start : start + STREAM_CHUNK_SIZE]
+
+
+# ============================================================================
+# BLUEPRINT HELPERS
+# ============================================================================
+
+def _bp_list(blueprint: ProjectBlueprint, name: str) -> List[Any]:
+    value = getattr(blueprint, name, None)
+    return value if isinstance(value, list) else []
+
+
+def _bp_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _tech_names(blueprint: ProjectBlueprint) -> List[str]:
+    names = []
+    for item in _bp_list(blueprint, "tech_stack"):
+        name = _bp_text(getattr(item, "name", None))
+        if name:
+            names.append(name)
+    return names
+
+
+def _architecture_items(blueprint: ProjectBlueprint) -> List[Any]:
+    return _bp_list(blueprint, "system_architecture")
+
+
+def _find_architecture(
+    blueprint: ProjectBlueprint,
+    type_name: str,
+) -> List[Any]:
+    return [
+        item
+        for item in _architecture_items(blueprint)
+        if _bp_text(getattr(item, "type", None)).lower() == type_name
+    ]
+
+
+def _has_technology(
+    blueprint: ProjectBlueprint,
+    keywords: Tuple[str, ...],
+) -> bool:
+    text = " ".join(
+        _tech_names(blueprint)
+        + [
+            _bp_text(getattr(item, "description", None))
+            for item in _architecture_items(blueprint)
+        ]
+    ).lower()
+
+    return any(keyword in text for keyword in keywords)
+
+
+# ============================================================================
+# PUBLIC API #3 - KEEP EXISTING RUNTIME-FLOW FUNCTION
+# ============================================================================
+
+def _blueprint_to_runtime_flow(
+    blueprint: ProjectBlueprint,
+) -> List[Dict[str, Any]]:
+    """
+    Deterministically create the runtime diagram from the Blueprint.
+
+    NO LLM.
+    NO JSON generated by a model.
+    """
+    architecture = _architecture_items(blueprint)
+    tech = _tech_names(blueprint)
+
+    frontend = _find_architecture(blueprint, "frontend")
+    backend = _find_architecture(blueprint, "backend")
+    database = _find_architecture(blueprint, "database")
+    external_api = _find_architecture(blueprint, "external_api")
+
+    frontend_name = (
+        _bp_text(getattr(frontend[0], "name", None), "Frontend")
+        if frontend
+        else "Frontend"
+    )
+    backend_name = (
+        _bp_text(getattr(backend[0], "name", None), "Backend")
+        if backend
+        else "Backend"
+    )
+    database_name = (
+        _bp_text(getattr(database[0], "name", None), "Database")
+        if database
+        else "Database"
+    )
+
+    frontend_tech = ", ".join(
+        _bp_text(getattr(x, "technologies", None))
+        for x in frontend
+    ).strip(", ")
+
+    backend_tech = ", ".join(
+        _bp_text(getattr(x, "technologies", None))
+        for x in backend
+    ).strip(", ")
+
+    has_ai = _has_technology(
+        blueprint,
+        (
+            "ai",
+            "llm",
+            "machine learning",
+            "deep learning",
+            "tensorflow",
+            "pytorch",
+            "groq",
+            "openrouter",
+            "model",
+            "generative",
+        ),
+    )
+
+    has_db = bool(database)
+    has_external_api = bool(external_api)
+
+    steps: List[Dict[str, Any]] = []
+
+    def add(
+        lane: str,
+        step_type: str,
+        title: str,
+        detail: str,
+        next_lane: Optional[str],
+        label: Optional[str],
+    ) -> None:
+        steps.append(
+            {
+                "lane": lane,
+                "type": step_type,
+                "title": title[:60],
+                "detail": detail[:400],
+                "arrowTo": next_lane,
+                "arrowLabel": label,
+            }
+        )
+
+    add(
+        "user",
+        "start",
+        "User Starts",
+        "The user opens the application and submits the requested input.",
+        "frontend",
+        "User action",
+    )
+
+    add(
+        "frontend",
+        "process",
+        "Capture Input",
+        f"{frontend_name} collects and validates the basic client-side input"
+        + (f" using {frontend_tech}." if frontend_tech else "."),
+        "frontend",
+        "Submit",
+    )
+
+    add(
+        "frontend",
+        "process",
+        "Send Request",
+        f"{frontend_name} sends the request to {backend_name} through the application's API.",
+        "backend",
+        "HTTP/API",
+    )
+
+    add(
+        "backend",
+        "decision",
+        "Validate Request",
+        f"{backend_name} validates the payload, required fields, authentication and business rules.",
+        "backend",
+        "Valid",
+    )
+
+    if has_external_api:
+        add(
+            "backend",
+            "process",
+            "Call External API",
+            "The backend sends required data to an external service and receives the service response.",
+            "backend",
+            "External response",
+        )
+
+    if has_ai:
+        add(
+            "ai",
+            "process",
+            "Run AI Logic",
+            "The AI/model layer processes the prepared input and returns the generated or predicted result.",
+            "backend",
+            "AI result",
+        )
+
+    if has_db:
+        add(
+            "database",
+            "process",
+            "Read or Write Data",
+            f"{database_name} stores or retrieves the application state required for the request.",
+            "backend",
+            "DB result",
+        )
+
+    add(
+        "backend",
+        "process",
+        "Build Response",
+        f"{backend_name} combines the processed result and prepares the API response"
+        + (f" using {backend_tech}." if backend_tech else "."),
+        "frontend",
+        "JSON response",
+    )
+
+    add(
+        "frontend",
+        "process",
+        "Update UI",
+        f"{frontend_name} receives the response and updates the visible application state.",
+        "output",
+        "Render",
+    )
+
+    add(
+        "output",
+        "end",
+        "Show Result",
+        "The user sees the final result produced by the application.",
+        None,
+        None,
+    )
+
+    # Keep the diagram compact and stable.
+    return steps[:14]
+
+
+def generate_runtime_flow(
+    project_name: str,
+    context: Optional[str] = None,
+) -> list:
+    """
+    Existing /api/runtime-flow entry point.
+
+    Cache HIT -> no LLM -> Python generates flow.
+    Cache MISS -> one blueprint LLM call -> Python generates flow.
+    """
+    blueprint = _get_or_create_blueprint(
+        project_name,
+        context,
+    )
+
+    flow = _blueprint_to_runtime_flow(blueprint)
+
+    logger.info(
+        "Runtime flow generated from cached blueprint: %d steps",
+        len(flow),
+    )
+
+    return flow
+
+
+# ============================================================================
+# PUBLIC API #4 - KEEP EXISTING UI PREVIEW FUNCTION
+# ============================================================================
+
+def _html_escape(value: Any) -> str:
+    return html.escape(_bp_text(value))
+
+
+def _render_architecture_cards(
+    blueprint: ProjectBlueprint,
+) -> str:
+    cards = []
+
+    for item in _architecture_items(blueprint):
+        name = _html_escape(getattr(item, "name", "Component"))
+        type_name = _html_escape(getattr(item, "type", "component"))
+        desc = _html_escape(getattr(item, "description", ""))
+
+        technologies = getattr(item, "technologies", None) or []
+        if not isinstance(technologies, list):
+            technologies = [technologies]
+
+        tech_html = "".join(
+            f"<span class='tag'>{_html_escape(t)}</span>"
+            for t in technologies
+            if _bp_text(t)
+        )
+
+        responsibilities = getattr(item, "responsibilities", None) or []
+        if not isinstance(responsibilities, list):
+            responsibilities = [responsibilities]
+
+        responsibility_html = "".join(
+            f"<li>{_html_escape(x)}</li>"
+            for x in responsibilities[:6]
+            if _bp_text(x)
+        )
+
+        cards.append(
+            f"""
+            <article class="card searchable">
+                <div class="card-head">
+                    <h3>{name}</h3>
+                    <span class="badge">{type_name}</span>
+                </div>
+                <p>{desc}</p>
+                <div class="tags">{tech_html}</div>
+                <ul>{responsibility_html}</ul>
+            </article>
+            """
+        )
+
+    return "".join(cards) or "<p class='muted'>No architecture components.</p>"
+
+
+def _render_tech_cards(
+    blueprint: ProjectBlueprint,
+) -> str:
+    cards = []
+
+    for item in _bp_list(blueprint, "tech_stack"):
+        name = _html_escape(getattr(item, "name", "Technology"))
+        category = _html_escape(getattr(item, "category", "Technology"))
+        reason = _html_escape(getattr(item, "reason", ""))
+
+        version = _bp_text(getattr(item, "version", None))
+        version_html = (
+            f"<span class='version'>{_html_escape(version)}</span>"
+            if version
+            else ""
+        )
+
+        cards.append(
+            f"""
+            <article class="card searchable">
+                <div class="card-head">
+                    <h3>{name}</h3>
+                    <span class="badge">{category}</span>
+                </div>
+                {version_html}
+                <p>{reason}</p>
+            </article>
+            """
+        )
+
+    return "".join(cards) or "<p class='muted'>No technologies.</p>"
+
+
+def _render_workflow(
+    blueprint: ProjectBlueprint,
+) -> str:
+    rows = []
+
+    for step in _bp_list(blueprint, "workflow"):
+        number = _html_escape(getattr(step, "step_number", ""))
+        title = _html_escape(getattr(step, "title", "Step"))
+        description = _html_escape(getattr(step, "description", ""))
+
+        actions = getattr(step, "key_actions", None) or []
+        if not isinstance(actions, list):
+            actions = [actions]
+
+        actions_html = "".join(
+            f"<li>{_html_escape(x)}</li>"
+            for x in actions[:4]
+            if _bp_text(x)
+        )
+
+        rows.append(
+            f"""
+            <div class="workflow-step searchable">
+                <div class="step-number">{number}</div>
+                <div>
+                    <h3>{title}</h3>
+                    <p>{description}</p>
+                    <ul>{actions_html}</ul>
+                </div>
+            </div>
+            """
+        )
+
+    return "".join(rows) or "<p class='muted'>No workflow steps.</p>"
+
+
+def _build_ui_preview_from_blueprint(
+    blueprint: ProjectBlueprint,
+) -> str:
+    project_name = _html_escape(
+        getattr(blueprint, "project_name", "Project")
+    )
+    description = _html_escape(
+        getattr(blueprint, "description", "")
+    )
+    problem = _html_escape(
+        getattr(blueprint, "problem_statement", "")
+    )
+
+    architecture_count = len(_architecture_items(blueprint))
+    tech_count = len(_bp_list(blueprint, "tech_stack"))
+    workflow_count = len(_bp_list(blueprint, "workflow"))
+    references_count = len(_bp_list(blueprint, "learning_references"))
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{project_name} — ArchiMind Preview</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {{
+    --bg:#0b1118;
+    --surface:#0f1923;
+    --surface2:#13212e;
+    --border:#223344;
+    --accent:#06b6d4;
+    --text:#e6f7f5;
+    --muted:#8da1b5;
+}}
+
+* {{ box-sizing:border-box; }}
+
+html,body {{
+    width:100%;
+    height:100%;
+    margin:0;
+}}
+
+body {{
+    background:var(--bg);
+    color:var(--text);
+    font-family:Inter,Arial,sans-serif;
+}}
+
+button,input {{ font:inherit; }}
+
+.shell {{
+    min-height:100%;
+    display:grid;
+    grid-template-columns:240px 1fr;
+}}
+
+.sidebar {{
+    background:#091019;
+    border-right:1px solid var(--border);
+    padding:22px 14px;
+    position:sticky;
+    top:0;
+    height:100vh;
+}}
+
+.logo {{
+    font-size:20px;
+    font-weight:700;
+    margin:0 8px 28px;
+}}
+
+.logo span {{ color:var(--accent); }}
+
+.nav button {{
+    width:100%;
+    border:0;
+    background:transparent;
+    color:var(--muted);
+    text-align:left;
+    padding:11px 12px;
+    border-radius:9px;
+    cursor:pointer;
+    margin-bottom:5px;
+}}
+
+.nav button:hover,
+.nav button.active {{
+    background:var(--surface2);
+    color:var(--text);
+}}
+
+.main {{
+    padding:28px;
+    max-width:1500px;
+    width:100%;
+    margin:auto;
+}}
+
+.top {{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:20px;
+    margin-bottom:22px;
+}}
+
+h1,h2,h3,p {{ margin-top:0; }}
+
+h1 {{
+    font-size:30px;
+    margin-bottom:8px;
+}}
+
+h2 {{
+    font-size:21px;
+    margin-bottom:15px;
+}}
+
+h3 {{
+    font-size:16px;
+    margin-bottom:7px;
+}}
+
+.muted {{ color:var(--muted); }}
+
+.search {{
+    background:var(--surface);
+    border:1px solid var(--border);
+    color:var(--text);
+    border-radius:9px;
+    padding:11px 13px;
+    min-width:250px;
+    outline:none;
+}}
+
+.search:focus {{ border-color:var(--accent); }}
+
+.stats {{
+    display:grid;
+    grid-template-columns:repeat(4,1fr);
+    gap:12px;
+    margin-bottom:25px;
+}}
+
+.stat {{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:17px;
+}}
+
+.stat strong {{
+    display:block;
+    font-size:25px;
+    margin-bottom:4px;
+}}
+
+.section {{
+    margin-bottom:32px;
+    scroll-margin-top:20px;
+}}
+
+.grid {{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(270px,1fr));
+    gap:13px;
+}}
+
+.card {{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:17px;
+    transition:transform .18s,border-color .18s;
+}}
+
+.card:hover {{
+    transform:translateY(-2px);
+    border-color:#315267;
+}}
+
+.card-head {{
+    display:flex;
+    justify-content:space-between;
+    gap:10px;
+    align-items:center;
+}}
+
+.badge,.tag,.version {{
+    display:inline-block;
+    font-size:11px;
+    border-radius:999px;
+    padding:4px 8px;
+    background:#142735;
+    color:#9debf4;
+}}
+
+.tags {{
+    display:flex;
+    flex-wrap:wrap;
+    gap:6px;
+    margin:12px 0;
+}}
+
+.card ul,.workflow-step ul {{
+    color:var(--muted);
+    padding-left:18px;
+    line-height:1.6;
+}}
+
+.workflow-step {{
+    display:grid;
+    grid-template-columns:42px 1fr;
+    gap:14px;
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:16px;
+    margin-bottom:10px;
+}}
+
+.step-number {{
+    width:36px;
+    height:36px;
+    display:grid;
+    place-items:center;
+    border-radius:50%;
+    background:#12313b;
+    color:var(--accent);
+    font-weight:700;
+}}
+
+.problem {{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-left:3px solid var(--accent);
+    border-radius:10px;
+    padding:17px;
+    line-height:1.6;
+}}
+
+.hidden {{ display:none !important; }}
+
+@media(max-width:850px) {{
+    .shell {{ grid-template-columns:1fr; }}
+    .sidebar {{
+        height:auto;
+        position:static;
+        border-right:0;
+        border-bottom:1px solid var(--border);
+    }}
+    .nav {{ display:flex; gap:6px; overflow:auto; }}
+    .nav button {{ white-space:nowrap; }}
+    .stats {{ grid-template-columns:repeat(2,1fr); }}
+    .top {{ flex-direction:column; }}
+    .search {{ width:100%; }}
+}}
+
+@media(max-width:500px) {{
+    .main {{ padding:18px; }}
+    .stats {{ grid-template-columns:1fr 1fr; }}
+}}
+</style>
+</head>
+<body>
+
+<div class="shell">
+    <aside class="sidebar">
+        <div class="logo">Archi<span>Mind</span></div>
+        <div class="nav">
+            <button class="active" data-target="overview">Overview</button>
+            <button data-target="architecture">Architecture</button>
+            <button data-target="workflow">Workflow</button>
+            <button data-target="stack">Tech Stack</button>
+        </div>
+    </aside>
+
+    <main class="main">
+        <header class="top">
+            <div>
+                <h1>{project_name}</h1>
+                <p class="muted">{description}</p>
+            </div>
+            <input id="search" class="search" placeholder="Search preview..." />
+        </header>
+
+        <section id="overview" class="section">
+            <div class="stats">
+                <div class="stat">
+                    <strong>{architecture_count}</strong>
+                    <span class="muted">Components</span>
+                </div>
+                <div class="stat">
+                    <strong>{tech_count}</strong>
+                    <span class="muted">Technologies</span>
+                </div>
+                <div class="stat">
+                    <strong>{workflow_count}</strong>
+                    <span class="muted">Workflow Steps</span>
+                </div>
+                <div class="stat">
+                    <strong>{references_count}</strong>
+                    <span class="muted">References</span>
+                </div>
+            </div>
+
+            <h2>Problem</h2>
+            <div class="problem">{problem}</div>
+        </section>
+
+        <section id="architecture" class="section">
+            <h2>System Architecture</h2>
+            <div class="grid">
+                {_render_architecture_cards(blueprint)}
+            </div>
+        </section>
+
+        <section id="workflow" class="section">
+            <h2>Workflow</h2>
+            {_render_workflow(blueprint)}
+        </section>
+
+        <section id="stack" class="section">
+            <h2>Technology Stack</h2>
+            <div class="grid">
+                {_render_tech_cards(blueprint)}
+            </div>
+        </section>
+    </main>
+</div>
+
+<script>
+(function () {{
+    const buttons = document.querySelectorAll(".nav button");
+    const search = document.querySelector("#search");
+    const items = document.querySelectorAll(".searchable");
+
+    function activateSection(id) {{
+        const section = document.getElementById(id);
+        if (section) {{
+            section.scrollIntoView({{ behavior: "smooth", block: "start" }});
+        }}
+        buttons.forEach(function (button) {{
+            button.classList.toggle(
+                "active",
+                button.dataset.target === id
+            );
+        }});
+    }}
+
+    buttons.forEach(function (button) {{
+        button.addEventListener("click", function () {{
+            activateSection(button.dataset.target);
+        }});
+    }});
+
+    search.addEventListener("input", function () {{
+        const query = search.value.toLowerCase().trim();
+
+        items.forEach(function (item) {{
+            const visible =
+                !query ||
+                item.textContent.toLowerCase().includes(query);
+
+            item.classList.toggle("hidden", !visible);
+        }});
+    }});
+}})();
+</script>
+
+</body>
+</html>"""
+
+
+def generate_ui_preview(
+    project_name: str,
+    context: Optional[str] = None,
+) -> str:
+    """
+    Existing /api/preview entry point.
+
+    Cache HIT -> no LLM -> Python HTML generation.
+    Cache MISS -> one blueprint LLM call -> Python HTML generation.
+
+    There is deliberately NO HTML-generation LLM call anymore.
+    """
+    blueprint = _get_or_create_blueprint(
+        project_name,
+        context,
+    )
+
+    html_output = _build_ui_preview_from_blueprint(blueprint)
+
+    logger.info(
+        "UI preview generated from cached blueprint: project=%s chars=%d",
+        getattr(blueprint, "project_name", project_name),
+        len(html_output),
+    )
+
+    return html_output
+
+
+# ============================================================================
+# OPTIONAL DEBUG HELPERS - DO NOT CHANGE ENDPOINTS
+# ============================================================================
+
+def clear_blueprint_cache() -> None:
+    """
+    Useful during development/testing.
+    Do not call this from normal request handling.
+    """
+    with _cache_lock:
+        _blueprint_cache.clear()
+        logger.info("Blueprint cache cleared.")
+
+
+def blueprint_cache_stats() -> Dict[str, Any]:
+    with _cache_lock:
+        _remove_expired_cache_entries()
+        return {
+            "entries": len(_blueprint_cache),
+            "max_entries": CACHE_MAX_ENTRIES,
+            "ttl_seconds": CACHE_TTL_SECONDS,
+            "llm_model": OPENROUTER_FREE_MODEL,
+            "llm_calls_for_runtime_flow": 0,
+            "llm_calls_for_ui_preview": 0,
+            "llm_calls_for_streaming_after_cache_hit": 0,
+        }
