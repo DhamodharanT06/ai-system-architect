@@ -686,16 +686,34 @@ def _search_sources_only(query: str) -> List[Any]:
                     logger.warning("Learning refs Tavily failed: %r", exc)
                     return []
 
+            async def github_query_from_blueprint() -> str:
+                project = _bp_text(getattr(blueprint, "project_name", ""))
+                technologies = _tech_names(blueprint)
+
+                keywords = [
+                    project,
+                    *technologies[:4],
+                ]
+
+                query = " ".join(
+                    part for part in keywords
+                    if part
+                )
+
+                return " ".join(query.split())[:150]
+            
             async def github():
                 token = getattr(settings, "github_token", "") or ""
                 gh_headers = {"Accept": "application/vnd.github+json"}
                 if token:
                     gh_headers["Authorization"] = f"Bearer {token}"
                 try:
+                    github_query = " ".join(search_query.split()[:8])
                     r = await client.get(
                         "https://api.github.com/search/repositories",
                         params={
-                            "q": search_query,
+                            # "q": search_query,
+                            "q": github_query,
                             "sort": "stars",
                             "per_page": 3,
                         },
